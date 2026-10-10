@@ -30,7 +30,7 @@ Input Select），把一台显示器在 Mac / Windows / Linux 之间切来切去
 | 显示器被另一台机器占用时仍可读可写 | ✅ 实机验证 |
 | 「把显示器抢回来」的持续重发（`dmux hold`） | ✅ 逻辑跑通，实机双向验证待另一台机器配合 |
 | 亮度调节 | ✅ 实机验证 |
-| GPUI 图形界面 | 🟡 代码完成，构建链路验证中 |
+| GPUI 图形界面 | ✅ 实机验证（截图确认文字、端口列表、当前源高亮均正常） |
 | 托盘常驻 / 全局快捷键 / 开机自启 | ⬜ 未做 |
 | Windows / Linux 后端 | ⬜ 未做（架构已预留，见下） |
 
@@ -150,16 +150,30 @@ cargo clippy --all-targets
 
 ### 构建 GPUI 的注意事项
 
-macOS 上没有完整 Xcode 时，GPUI 默认构建会失败——它的 `build.rs` 会调用
-`xcrun -sdk macosx metal`，而该工具只随完整 Xcode 提供。本项目因此固定使用
-`runtime_shaders`：
+有两个 feature 是**必须同时存在**的，少任何一个都会出问题：
 
 ```toml
-gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders"] }
+gpui = { version = "0.2.2", default-features = false, features = [
+    "runtime_shaders",  # macOS 没有完整 Xcode 时必需
+    "font-kit",         # 否则 macOS 上完全没有文字
+], optional = true }
 ```
 
-这样只装 Command Line Tools 也能构建成功（首次启动时在运行时编译着色器）。
-装了完整 Xcode 的话可以去掉它换取更快启动。
+- **`runtime_shaders`**：GPUI 的 `build.rs` 默认会调用 `xcrun -sdk macosx metal`，
+  而该工具只随**完整 Xcode** 提供。用这个 feature 改成运行时编译着色器，只装
+  Command Line Tools 也能构建（代价是首次启动略慢）。装了完整 Xcode 可以去掉。
+
+- **`font-kit`**：它在 gpui 的 **default feature 集合**里，所以一旦写
+  `default-features = false` 就会被静默关掉，macOS 后端随即回落到
+  `NoopTextSystem` —— **窗口、布局、配色全部正常，但一个字形都不画**。
+  这个坑不会以编译错误或运行时报错的形式出现，Zed 官方也踩过
+  （[zed#59241](https://github.com/zed-industries/zed/pull/59241)）。
+
+> **排查口诀**：界面正常但没有文字 → 先跑
+> `cargo tree -e normal | grep -c font-kit`，`0` 就是病因。
+
+完整的实测记录见 [docs/hardware-notes.md](docs/hardware-notes.md#26-default-features--false-会静默关掉整个文字渲染)；
+gpui 版本策略与社区实践见 [docs/gpui-versioning.md](docs/gpui-versioning.md)。
 
 ---
 

@@ -36,8 +36,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # GPUI is only needed for the GUI bin, but Cargo features are per-crate rather
-# than per-bin; the extra trees are marked optional below where possible.
-gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders"], optional = true }
+# than per-bin, so it is marked optional and enabled by the `gui` feature.
+#
+# `font-kit` is NOT really optional, even though it looks like one. It lives in
+# gpui's default feature set, and building with `default-features = false`
+# (which we need in order to get `runtime_shaders`) silently drops it. On macOS
+# that makes `MacPlatform` fall back to `gpui::NoopTextSystem`: the window lays
+# out perfectly, font metrics still answer, and *no glyph is ever painted*.
+# Zed hit the same trap in its own `component_preview` example
+# (zed-industries/zed#59241). Keep `font-kit` in this list.
+gpui = { version = "0.2.2", default-features = false, features = [
+    "runtime_shaders",
+    "font-kit",
+], optional = true }
 
 [features]
 default = []

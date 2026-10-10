@@ -16,7 +16,7 @@
 //!   * a *write* followed by any further DDC transaction in the SAME process
 //!     wedges the channel (`MacOS kernel I/O error 0x10000003`), and the only
 //!     recovery is a fresh process / fresh IOAVService.
-//! Therefore: one operation per process (`dmux-ddc-helper <op>`), or, for
+//! Therefore either one operation per process (`dmux-ddc-helper <op>`), or, for
 //! read-only polling, `dmux-ddc-helper serve`, which never writes.
 
 use ddc_hi::{Ddc, Display};

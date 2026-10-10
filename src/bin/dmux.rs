@@ -54,8 +54,10 @@ fn print_inputs(st: &ddc::Status) {
 
 fn cmd_status(args: &[String]) -> Result<(), DdcError> {
     let idx = index_of(args);
-    let want_caps = args.iter().any(|a| a == "--caps");
     let persistent = args.iter().any(|a| a == "--persistent");
+    // Always read capabilities: without them the input list would be the MCCS
+    // fallback, and every port would be mislabelled as "(not advertised)".
+    let want_caps = true;
     let st = if persistent {
         let mut r = ddc::Reader::spawn()?;
         r.status(idx, DEFAULT_TIMEOUT)?

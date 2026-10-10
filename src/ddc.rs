@@ -415,12 +415,7 @@ impl Reader {
             }
         });
 
-        let mut reader = Reader {
-            child: child,
-            stdin: stdin,
-            rx: rx,
-            advertised: None,
-        };
+        let reader = Reader { child, stdin, rx, advertised: None };
 
         // Consume the `serve-ready` handshake. It doubles as proof that the
         // helper finished its DDC warm-up, so the very first real request cannot
@@ -433,11 +428,6 @@ impl Reader {
                 {
                     return Err(DdcError::Protocol("no DDC-capable displays found".into()));
                 }
-                reader
-                    .advertised
-                    .is_none()
-                    .then_some(())
-                    .ok_or_else(|| DdcError::Protocol("handshake failed".into()))?;
             }
             Err(_) => return Err(DdcError::Timeout { secs: 10 }),
         }

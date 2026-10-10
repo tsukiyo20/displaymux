@@ -1,40 +1,63 @@
 //! dmux-gui - GPUI front end for the monitor input switcher.
 //!
-//! This binary is gated behind the `gui` feature so that the CLI (and plain
+//! This binary is gated behind the `gui` feature so the CLI (and a plain
 //! `cargo test`) do not pull in GPUI's ~700-crate dependency tree:
 //!
 //!     cargo build --release --features gui --bin dmux-gui
 //!
 //! Without the feature this file compiles to a stub that explains itself.
+//!
+//! ## Threading model
+//!
+//! Forced by the hardware behaviour measured in `docs/hardware-notes.md`:
+//!
+//! ```text
+//! UI thread (GPUI)            worker thread                   fresh process
+//! ----------------            -------------                   -------------
+//! send(Request)        --->   persistent Reader (reads only)  dmux-ddc-helper serve
+//! poll via 60ms timer  <---   response channel
+//!                             ddc::set_input (writes)      -> dmux-ddc-helper set-input
+//! ```
+//!
+//! * `ddc::Reader` owns a `std::process::Child`, so it is **not `Send`** and has
+//!   to live entirely inside the worker thread. The UI thread only ever touches
+//!   channels, and never blocks on DDC (a read costs ~120-200 ms).
+//! * Writes go through a throwaway process, because a write wedges the DCP I2C
+//!   channel for the rest of that process. Reads are safe to share one
+//!   long-lived process, which is why the reader is persistent.
 
 #[cfg(not(feature = "gui"))]
 fn main() {
     eprintln!(
-        "dmux-gui was built without the GPUI front end.\n\
-         Build it with:\n\
-         \n\
+        "dmux-gui was built without the GPUI front end.\n\n\
+         Build it with:\n\n\
          \tcargo build --release --features gui --bin dmux-gui\n"
     );
     std::process::exit(2);
 }
 
 #[cfg(feature = "gui")]
+fn main() {
+    gui::run();
+}
+
+#[cfg(feature = "gui")]
 mod gui {
-    use gpui::{
-        div, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent, Context, IntoElement,
-        MouseButton, SharedString, Window, WindowBounds, WindowOptions,
-    };
     use displaymux::ddc::{self, Status};
-    use displaymux::vcp;
+    use gpui::{
+        div, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent, Context,
+        IntoElement, SharedString, Window, WindowBounds, WindowOptions,
+    };
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const READ_TIMEOUT: Duration = Duration::from_secs(12);
+    const POLL_INTERVAL: Duration = Duration::from_millis(60);
 
     #[derive(Debug)]
     enum Request {
-        Refresh { caps: bool },
+        Refresh,
         Switch { index: usize, code: String },
         Reclaim { index: usize, code: String, every: Duration, up_to: Duration },
     }
@@ -46,11 +69,12 @@ mod gui {
         Reclaim(Box<Result<String, String>>),
     }
 
-    /// Owns the DDC reader and performs all DDC work off the UI thread.
+    /// Owns the DDC reader and performs every DDC call off the UI thread.
     struct Worker {
         tx: Sender<Request>,
-        /// Shared so the polling future can own a handle without borrowing `self`.
-        /// (GPUI's `spawn` needs a `'static` future; this keeps it free of unsafe.)
+        /// Shared so the polling future can own a handle without borrowing
+        /// `self`: GPUI's `spawn` needs a `'static` future. This satisfies that
+        /// without any `unsafe`.
         rx: Arc<Mutex<Receiver<Response>>>,
     }
 
@@ -62,31 +86,24 @@ mod gui {
             std::thread::Builder::new()
                 .name("ddc-worker".into())
                 .spawn(move || {
-                    // Reader is created inside the thread: it is !Send.
+                    // Created inside the thread: `Reader` is !Send.
                     let mut reader: Option<ddc::Reader> = None;
-                    let mut ensure = |r: &mut Option<ddc::Reader>| -> Result<(), String> {
-                        if r.is_none() {
-                            *r = Some(ddc::Reader::spawn().map_err(|e| e.to_string())?);
-                        }
-                        Ok(())
-                    };
 
                     while let Ok(req) = req_rx.recv() {
                         match req {
-                            Request::Refresh { caps } => {
-                                let _ = caps;
-                                let out = ensure(&mut reader)
-                                    .and_then(|_| {
-                                        reader
-                                            .as_mut()
-                                            .unwrap()
-                                            .status(0, READ_TIMEOUT)
-                                            .map_err(|e| e.to_string())
-                                    });
-                                if out.is_err() {
-                                    // A dead reader is replaced on the next request.
-                                    reader = None;
-                                }
+                            Request::Refresh => {
+                                let out = match reader.get_or_insert_with(|| {
+                                    ddc::Reader::spawn().expect("spawn ddc reader")
+                                }).status(0, READ_TIMEOUT) {
+                                    Ok(st) => Ok(st),
+                                    Err(e) => {
+                                        // Drop it: the next request builds a fresh
+                                        // IOAVService, the only way to recover a
+                                        // wedged channel.
+                                        reader = None;
+                                        Err(e.to_string())
+                                    }
+                                };
                                 if res_tx.send(Response::Status(Box::new(out))).is_err() {
                                     break;
                                 }
@@ -95,8 +112,8 @@ mod gui {
                                 let out = ddc::set_input(index, &code, READ_TIMEOUT)
                                     .map(|o| o.verdict().to_string())
                                     .map_err(|e| e.to_string());
-                                // The old reader's IOAVService may have been invalidated
-                                // by the switch; force a fresh one.
+                                // The switch may have invalidated the reader's
+                                // IOAVService, so force a fresh one next time.
                                 reader = None;
                                 if res_tx.send(Response::Switched(Box::new(out))).is_err() {
                                     break;
@@ -119,11 +136,12 @@ mod gui {
         }
     }
 
-    /// Re-assert `code` until this host is selected again (or time runs out).
+    /// Re-assert `code` every `every` until this host is selected again, or
+    /// `up_to` elapses.
     ///
-    /// This is what lets a Mac take the monitor back from the other machine: DDC
-    /// stays reachable while the monitor displays someone else, so repeating the
-    /// request eventually wins once the other input goes idle.
+    /// This is what lets the Mac take the monitor back from the other machine:
+    /// DDC stays reachable while the monitor displays someone else, so repeating
+    /// the request wins as soon as the other input stops being driven.
     fn reclaim(
         index: usize,
         code: &str,
@@ -131,7 +149,7 @@ mod gui {
         up_to: Duration,
         reader: &mut Option<ddc::Reader>,
     ) -> Result<String, ddc::DdcError> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut attempts = 0u32;
         loop {
             attempts += 1;
@@ -145,11 +163,15 @@ mod gui {
                 .map(|c| c.eq_ignore_ascii_case(code))
                 .unwrap_or(false);
             if already {
-                return Ok(format!("reclaimed after {} attempt(s)", attempts));
+                return Ok(format!("already on {} after {} probe(s)", code, attempts));
             }
             ddc::set_input(index, code, READ_TIMEOUT)?;
             if start.elapsed() >= up_to {
-                return Ok(format!("gave up after {} attempt(s), {}s", attempts, start.elapsed().as_secs()));
+                return Ok(format!(
+                    "gave up after {} attempt(s) / {}s",
+                    attempts,
+                    start.elapsed().as_secs()
+                ));
             }
             std::thread::sleep(every);
         }
@@ -166,7 +188,7 @@ mod gui {
     impl SwitchApp {
         fn new(cx: &mut Context<Self>) -> Self {
             let worker = Worker::spawn();
-            let _ = worker.tx.send(Request::Refresh { caps: true });
+            let _ = worker.tx.send(Request::Refresh);
             let app = SwitchApp {
                 worker,
                 status: None,
@@ -179,12 +201,12 @@ mod gui {
         }
 
         /// Poll the worker's response channel on a timer, so the UI thread never
-        /// blocks on DDC. This is the "async without async" bridge to the worker.
+        /// blocks on DDC. This is the bridge to the worker thread.
         fn poll(&self, cx: &mut Context<Self>) {
             let rx = self.worker.rx.clone();
             cx.spawn(async move |this, cx| {
                 loop {
-                    cx.background_executor().timer(Duration::from_millis(60)).await;
+                    cx.background_executor().timer(POLL_INTERVAL).await;
                     let got = rx.lock().ok().map(|r| r.try_recv());
                     match got {
                         Some(Ok(resp)) => {
@@ -195,7 +217,7 @@ mod gui {
                             break;
                         }
                         Some(Err(std::sync::mpsc::TryRecvError::Empty)) => continue,
-                        // disconnected or poisoned: stop polling
+                        // Disconnected or poisoned: stop polling.
                         _ => break,
                     }
                 }
@@ -216,6 +238,9 @@ mod gui {
                                 .map(|e| format!("monitor not answering: {}", e).into())
                                 .unwrap_or_else(|| "monitor not answering".into()),
                         };
+                        if !s.inputs.is_empty() {
+                            self.index = s.display_index;
+                        }
                         self.status = Some(s);
                     }
                     Err(e) => self.message = format!("read failed: {}", e).into(),
@@ -235,7 +260,7 @@ mod gui {
             }
         }
 
-        fn send(&mut self, req: Request, note: &str, cx: &mut Context<Self>) {
+        fn send(&mut self, req: Request, note: impl Into<SharedString>, cx: &mut Context<Self>) {
             if self.busy {
                 return;
             }
@@ -291,7 +316,7 @@ mod gui {
                 let _ = app.update(cx, |app: &mut SwitchApp, cx| {
                     app.send(
                         Request::Switch { index: app.index, code: code.clone() },
-                        &format!("switching to {}...", code),
+                        format!("switching to {}...", code),
                         cx,
                     );
                 });
@@ -304,7 +329,7 @@ mod gui {
                 .status
                 .as_ref()
                 .map(|s| s.display_id.clone())
-                .unwrap_or_else(|| "no monitor".into());
+                .unwrap_or_else(|| "no DDC monitor".to_string());
             let busy = self.busy;
             let message = self.message.clone();
             let weak = cx.entity().downgrade();
@@ -366,7 +391,7 @@ mod gui {
                                     move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
                                         let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
                                             app.send(
-                                                Request::Refresh { caps: true },
+                                                Request::Refresh,
                                                 "reading monitor state...",
                                                 cx,
                                             );
@@ -423,7 +448,7 @@ mod gui {
         }
     }
 
-    fn main() {
+    pub fn run() {
         Application::new().run(|cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
             cx.open_window(
@@ -431,12 +456,10 @@ mod gui {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_window, cx| cx.new(|cx| SwitchApp::new(cx)),
+                |_window, cx| cx.new(SwitchApp::new),
             )
             .expect("open window");
             cx.activate(true);
-            let _ = vcp::fallback_inputs();
-            let _ = MouseButton::Left;
         });
     }
 }

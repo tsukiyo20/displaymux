@@ -15,3 +15,7 @@
 # scratch
 /tmp/
 *.log
+
+# Working notes: hardware findings and dependency research kept locally for
+# reference. Deliberately not part of the published repository.
+/notes/

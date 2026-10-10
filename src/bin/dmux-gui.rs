@@ -7,9 +7,22 @@
 //!
 //! Without the feature this file compiles to a stub that explains itself.
 //!
+//! ## What this UI refuses to claim
+//!
+//! Switching a monitor's input is **not reversible from this side**. When the
+//! display moves to another machine, this host loses the video path — and on a
+//! desk where the keyboard and mouse hang off the monitor's USB hub, it loses
+//! its input devices too. There is no hotkey that could bring the display back.
+//!
+//! For the same reason the UI never states which input the display is on. Some
+//! monitors report a constant VCP 0x60 regardless of the selected input, so the
+//! readback is not evidence; the only trustworthy "is it showing us?" signal is
+//! [`displaymux::session`], and rows are labelled "last sent here" because that
+//! is a record of our own command rather than a reading of the hardware.
+//!
 //! ## Threading model
 //!
-//! Forced by the hardware behaviour measured in `docs/hardware-notes.md`:
+//! Forced by the behaviour of the DDC channel on macOS:
 //!
 //! ```text
 //! UI thread (GPUI)            worker thread                   fresh process

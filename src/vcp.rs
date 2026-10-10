@@ -115,7 +115,8 @@ mod tests {
 
     #[test]
     fn parses_real_caps_string() {
-        // the exact string reported by the R32U81 in this session
+        // a capabilities string as reported by a real monitor, including the
+        // space some firmwares emit after the value-list opening paren
         let caps = "(prot(monitor)type(lcd)MStarcmds(01 02 03 07 0C E3 F3)\
 vcp(02 10 12 14(05 06 08 0B) 16 18 1A 52 60( 11 12 0F 10) 62 AA(01 02) AC AE B2 B6 C6 C8 C9 D6(01 04 05)  DF FD)mccs_ver(2.1)mswhql(1))";
         let mut got = parse_vcp_values(caps, 0x60);

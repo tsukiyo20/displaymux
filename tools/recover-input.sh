@@ -5,8 +5,8 @@
 # an input with no signal, some monitors hold that input (showing "no signal")
 # instead of falling back, and the host that issued the switch can be left
 # unable to see its own screen. This script re-asserts an input repeatedly,
-# across fresh processes, because a DDC write wedges the channel for the rest of
-# the issuing process (see docs/hardware-notes.md 2.1).
+# across fresh processes, because a DDC write can leave the channel unusable for
+# the rest of the issuing process.
 #
 # usage: tools/recover-input.sh [input] [attempts]
 #        tools/recover-input.sh 0x10 20

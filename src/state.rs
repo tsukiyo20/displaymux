@@ -1,14 +1,10 @@
 //! Persisted state that cannot be read back from the hardware.
 //!
-//! Why this exists: on the monitor this project was developed against, VCP 0x60
-//! reports a **constant** value that does not follow the actual input. Measured
-//! on an R32U81 (Mac on the Type-C port, Windows on the DP port):
-//!
-//! * monitor showing the Mac     -> VCP 0x60 reads `0x10`
-//! * monitor switched to Windows -> VCP 0x60 still reads `0x10`
-//!
-//! while a switch commanded to `0x0f` *did* move the display to the other
-//! machine. The write works; the readback lies.
+//! Why this exists: some monitors report a **constant** VCP 0x60 regardless of
+//! the selected input. On such a display the readback says `0x10` both while it
+//! is showing this host and after it has been switched to another machine, even
+//! though a switch commanded to `0x0f` demonstrably moves the display. The write
+//! works; the readback is not evidence.
 //!
 //! So "which input is this host on" cannot be derived from the monitor. We
 //! record what the user last asked for and treat that as the truth, with the
@@ -90,9 +86,9 @@ mod tests {
     #[test]
     fn remembers_per_display() {
         let mut s = State::default();
-        s.remember_input("R32U81", "0x0F");
+        s.remember_input("monitor-a", "0x0F");
         s.remember_input("Other", "0x11");
-        assert_eq!(s.last_input("R32U81"), Some("0x0f"));
+        assert_eq!(s.last_input("monitor-a"), Some("0x0f"));
         assert_eq!(s.last_input("Other"), Some("0x11"));
         assert_eq!(s.last_input("unknown"), None);
     }
@@ -100,17 +96,17 @@ mod tests {
     #[test]
     fn round_trips_through_json() {
         let mut s = State::default();
-        s.remember_input("R32U81", "0x0f");
+        s.remember_input("monitor-a", "0x0f");
         let text = serde_json::to_string(&s).unwrap();
         let back: State = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.last_input("R32U81"), Some("0x0f"));
+        assert_eq!(back.last_input("monitor-a"), Some("0x0f"));
     }
 
     #[test]
     fn tolerates_missing_or_foreign_file() {
         // An empty file, or one written by a future version, must not panic.
         let empty: State = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty.last_input("R32U81"), None);
+        assert_eq!(empty.last_input("monitor-a"), None);
         let extra: State =
             serde_json::from_str(r#"{"last_input":{"d":"0x10"},"future_field":42}"#).unwrap();
         assert_eq!(extra.last_input("d"), Some("0x10"));

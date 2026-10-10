@@ -10,19 +10,22 @@
 //!
 //! ## The signal we use instead
 //!
-//! On this desk the keyboard and mouse hang off the monitor's built-in USB hub,
-//! and that hub follows the selected input:
+//! Many monitors expose a built-in USB hub whose upstream port follows the
+//! selected input. When peripherals are attached there, their presence is a
+//! *real* signal rather than a claim: while they are enumerated the monitor is
+//! routed to this host, and when they disappear the display has moved.
+//!
+//! Because this depends on how the desk is wired, it is opt-in rather than
+//! guessed. Set two environment variables to the substrings that identify your
+//! hardware in the USB tree:
 //!
 //! ```text
-//! AppleT8132USBXHCI
-//!   +-o USB2.1 Hub (GenesysLogic)     <- the monitor's hub
-//!        +-o QK ALICE                  <- keyboard
-//!        +-o Wireless mouse 8k dongle  <- mouse
+//! DMUX_DEVICE_HINTS=<substring>,<substring>   # devices behind the monitor hub
+//! DMUX_HUB_HINT=<substring>                   # the monitor's hub itself
 //! ```
 //!
-//! So device presence is a *real* signal rather than a claim: if the keyboard
-//! and mouse are present, the monitor is currently routed to this host;
-//! if they vanish, the display has moved elsewhere. No DDC involved.
+//! With these unset the module reports [`Session::Unknown`], which is the
+//! honest answer: it never claims the display is here without evidence.
 //!
 //! ## What this deliberately does not do
 //!
@@ -59,12 +62,27 @@ impl Session {
     }
 }
 
-/// Devices we look for behind the monitor's hub.
-const HID_HINTS: [&str; 2] = ["QK ALICE", "Wireless mouse"];
-/// The hub chip the monitor uses. Its presence with the devices missing is what
-/// distinguishes "display switched away" from "these peripherals are simply not
-/// attached to this machine".
-const MONITOR_HUB_HINTS: [&str; 2] = ["GenesysLogic", "USB2.1 Hub"];
+/// Substrings identifying the devices that sit behind the monitor's hub.
+const HINTS_ENV: &str = "DMUX_DEVICE_HINTS";
+/// Substrings identifying the monitor's own hub.
+///
+/// The hub being present while the devices are gone is what separates "the
+/// display switched away" from "these peripherals are simply not attached
+/// here", so both hints are required for a verdict.
+const HUB_ENV: &str = "DMUX_HUB_HINT";
+
+/// Read a comma-separated hint list from the environment.
+fn hints(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Inspect the USB tree and decide whether this host is on screen.
 ///
@@ -78,25 +96,32 @@ pub fn current() -> Session {
 fn detect() -> Option<Session> {
     use std::process::Command;
 
-    // `ioreg` is always present on macOS and avoids pulling in a whole IOKit
-    // binding just to read device names.
+    let devices = hints(HINTS_ENV);
+    let hubs = hints(HUB_ENV);
+    // Without configuration there is nothing to look for, and guessing would be
+    // worse than admitting ignorance.
+    if devices.is_empty() || hubs.is_empty() {
+        return Some(Session::Unknown);
+    }
+
+    // `ioreg` ships with macOS and avoids pulling in an IOKit binding just to
+    // read device names.
     let out = Command::new("ioreg")
         .args(["-p", "IOUSB", "-w0", "-l"])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
 
-    let has_hid = HID_HINTS.iter().any(|h| text.contains(h));
-    let has_monitor_hub = MONITOR_HUB_HINTS.iter().any(|h| text.contains(h));
+    let has_devices = devices.iter().any(|h| text.contains(h.as_str()));
+    let has_hub = hubs.iter().any(|h| text.contains(h.as_str()));
 
-    Some(match (has_monitor_hub, has_hid) {
+    Some(match (has_hub, has_devices) {
         // Devices behind the monitor's hub: it is routed to us.
         (true, true) => Session::Visible,
         // Hub present, devices gone: the monitor switched its USB upstream.
         (true, false) => Session::SwitchedAway,
-        // No monitor hub in the tree at all. Either the peripherals are plugged
-        // in directly, or we are looking at a different machine entirely.
-        // Either way we cannot infer anything trustworthy.
+        // No monitor hub in the tree at all: the peripherals are wired some
+        // other way and we cannot infer anything trustworthy.
         (false, _) => Session::Unknown,
     })
 }
@@ -122,12 +147,25 @@ mod tests {
 
     #[test]
     fn detection_never_panics_and_is_one_of_three_states() {
-        // On a machine without the monitor attached this returns Unknown, which
-        // is the point: it must not claim Visible.
+        // Unconfigured, or on a machine with no such wiring, this returns
+        // Unknown -- which is the point: it must never claim Visible.
         let s = current();
         assert!(matches!(
             s,
             Session::Visible | Session::SwitchedAway | Session::Unknown
         ));
+    }
+
+    #[test]
+    fn hint_parsing_handles_empty_and_padded_lists() {
+        // Guards the shape of the env contract without touching the environment.
+        let parse = |v: &str| -> Vec<String> {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        assert!(parse("").is_empty());
+        assert_eq!(parse(" a , b "), vec!["a", "b"]);
     }
 }

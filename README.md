@@ -1,260 +1,215 @@
 # displaymux
 
-轻量的跨平台**显示器信号源切换**工具：通过 DDC/CI 控制显示器的输入源（VCP `0x60`
-Input Select），把一台显示器在 Mac / Windows / Linux 之间切来切去。
+Switch a monitor's input source from the command line or the menu bar, over
+DDC/CI.
 
-- **命令行**：`dmux`
-- **图形界面**：`dmux-gui`（[GPUI](https://gpui.rs)，Zed 的 GPU 原生 UI 框架）
+`displaymux` is a small, native tool for desks where one monitor is shared by more
+than one computer. Instead of reaching for the monitor's buttons, pick the input
+from a menu — or script it.
 
-> 目标形态是一个**常驻的小工具**：启动快、占用低、点一下就切。
-> 因此刻意**不使用 WebView**（Tauri / Electron / wry 这类每个窗口都要拖一个
-> Web 引擎进程，对"偶尔点一下"的工具属于压倒性开销）。
+```
+DELL U2720Q
+────────────────────────────────
+0x0f  DisplayPort 1          switch
+0x10  DisplayPort 2   last sent here
+0x11  HDMI 1                 switch
+0x12  HDMI 2                 switch
+────────────────────────────────
+4 inputs available
+```
 
-参考实现：[haimgel/display-switch](https://github.com/haimgel/display-switch)
-（把 30 美元的 USB 切换器变成 KVM）。displaymux 面向的是**图形界面 + 手动/自动
-切换**，而不是它的「USB 设备插拔触发」模式；两者共用同一套 macOS 底层
-（`ddc-macos` 的作者就是 display-switch 的作者）。
+## Contents
 
----
+- [Why another one](#why-another-one)
+- [Platform support](#platform-support)
+- [Building](#building)
+- [Command line](#command-line)
+- [Menu bar](#menu-bar)
+- [How it works](#how-it-works)
+- [Limitations](#limitations)
+- [License](#license)
 
-## 当前状态
+## Why another one
 
-在真实硬件上验证过的部分，和还没做的部分，分得很清楚：
+Most DDC/CI utilities either stop at one platform or expose only brightness and
+contrast. displaymux focuses on **input selection**, the one thing you need when
+two machines share a display, and it tries to be honest about what it cannot
+know:
 
-| 能力 | 状态 |
-|---|---|
-| 枚举 DDC 显示器 | ✅ 实机验证 |
-| 读取当前输入源 / 亮度 | ✅ 实机验证（8/8 稳定） |
-| 解析显示器 capabilities，得出可切端口列表 | ✅ 实机验证（含单元测试） |
-| **切换输入源** | ✅ 实机验证（显示器确实切走） |
-| 显示器被另一台机器占用时仍可读可写 | ✅ 实机验证 |
-| 「把显示器抢回来」的持续重发（`dmux hold`） | ✅ 逻辑跑通，实机双向验证待另一台机器配合 |
-| 亮度调节 | ✅ 实机验证 |
-| GPUI 图形界面 | ✅ 实机验证（gpui 1.24，截图确认文字、端口列表、当前源高亮） |
-| 菜单栏常驻（托盘） | ✅ 实机验证（截图确认图标、菜单内容、勾选、点击派发） |
-| 全局快捷键 / 开机自启 | ⬜ 未做 |
-| Windows / Linux 后端 | ⬜ 未做（架构已预留，见下） |
+- **A switch is treated as a one-way command.** The UI never claims to know which
+  input the display is on — see [Limitations](#limitations).
+- **DDC is driven defensively.** On macOS a write can leave the I2C channel
+  unusable for the remainder of the process, so writes run in a throwaway
+  subprocess while reads share one long-lived process.
+- **The GUI is native.** [GPUI](https://gpui.rs), no webview and no bundled
+  browser runtime; roughly a 4 MB binary.
 
-唯一实测平台：**macOS 27 / Apple M4**，显示器 R32U81（Mac 接 USB-C，另一台接 DP）。
+## Platform support
 
----
+| Platform | Backend | Status |
+|---|---|---|
+| macOS (Apple Silicon) | private `CoreDisplay` / `IOAVService` via [`ddc-macos`](https://github.com/haimgel/ddc-macos-rs) | Works |
+| macOS (Intel) | `IOFramebufferI2CInterface` | Untested |
+| Windows | Monitor Configuration API (`dxva2`) | Compiles, untested on hardware |
+| Linux | `ddcutil` / `/dev/i2c-*` | Not implemented |
 
-## 快速开始
+The Windows path needs no platform-specific code: `ddc-hi` already routes to
+`ddc-winapi`, which covers enumeration, `GetVCPFeatureAndVCPFeatureReply`,
+`SetVCPFeature` and `GetCapabilitiesString`. The CLI and helper should build and
+run there as they are.
+
+> On macOS, DDC is unavailable through the built-in HDMI port on some models. A
+> monitor attached over USB-C or DisplayPort is the reliable case.
+
+## Building
+
+Rust 1.99 or newer, pinned in `rust-toolchain.toml`.
 
 ```bash
-# 构建命令行工具（不含 GUI，依赖少、构建快）
+# Command line tool and its DDC helper
 cargo build --release --bin dmux --bin dmux-ddc-helper
 
-# 看有哪些显示器和端口
-./target/release/dmux list
-./target/release/dmux status
-
-# 切换（支持别名：hdmi1 / dp2 / usbc1，也支持 0x11 或 17）
-./target/release/dmux set hdmi1
-
-# 在 10 秒内反复重发，直到本机这一路被选中
-./target/release/dmux hold dp2 --every=2 --for=10
-```
-
-`dmux-ddc-helper` 必须和 `dmux` 放在同一目录（或放在 `PATH` 里，或用环境变量
-`DMUX_DDC_HELPER` 指定绝对路径）。
-
-图形界面：
-
-```bash
+# GUI and menu bar item
 cargo build --release --features gui --bin dmux-gui
-./target/release/dmux-gui
 ```
 
----
+`dmux-ddc-helper` must sit next to `dmux`, be on `PATH`, or be pointed at with
+`DMUX_DDC_HELPER`. Building both binaries into one target directory satisfies
+that automatically.
 
-## ⚠️ 屏幕黑了怎么办
+The GUI sits behind the `gui` feature so the CLI stays cheap to build: GPUI brings
+a large dependency tree that the DDC core does not need.
 
-**DDC 输入切换是 fire-and-forget 的。** 如果你切到了一个**没有信号**的输入
-（对方机器关机、线没插、或者你切错了口），显示器可能**停在那一路显示"无信号"**，
-而不是自动回切——这时你反而看不到自己的屏幕了。
+### A note on the GPUI dependency
 
-恢复顺序：
-
-1. **按显示器上的输入源按钮**（或 OSD → Input），选回本机那一路。最快、最可靠。
-2. 显示器的输入项在本文里都用**原始 VCP 值**标注（如 `0x10`），方便和 OSD 对号。
-3. 如果按不到（例如显示器在远处），试电源重插。
-4. 也可以用脚本重发（**前提是 DDC 通道还活着**，见下）：
-
-```bash
-tools/recover-input.sh 0x10 20     # 反复把输入抢回 0x10，每个尝试用新进程
-```
-
-> **为什么脚本可能也没用**：一次 DDC 写入会把该进程的 I2C 通道弄坏
-> （见 [hardware-notes 2.1](docs/hardware-notes.md)），而且当显示器正在显示别的
-> 输入时，读回会失败。所以恢复脚本必须**每 2 秒换一个新进程**重发——这也是它
-> 存在的原因。但**如果通道整体处于坏态，任何软件手段都无效**，只能走 OSD。
-
-**给使用者的建议**：切之前先确认目标输入**确实有信号源开着**。本工具不会替你
-判断这一点——它只知道显示器声明了哪些口。
-
----
-
-## 设计要点（都是被硬件逼出来的）
-
-完整实测记录见 **[docs/hardware-notes.md](docs/hardware-notes.md)**，这里只列结论：
-
-1. **一次操作一个进程。** 在 Apple Silicon 上，一个进程里「写完再读」会把 DCP 的
-   I2C 通道弄坏（`MacOS kernel I/O error 0x10000003`），且**进程内无法恢复**。
-   所以写入走一次性进程（`dmux-ddc-helper set-input`），用完即弃。
-
-2. **读取则共用常驻进程。** 实测读不会破坏通道（8/8 稳定），因此 `dmux-ddc-helper
-   serve` 常驻，把 UI 刷新从「每次开进程 + I/O Kit 枚举」的约 190ms 降到约 116ms。
-
-3. **新句柄的第一次事务必失败。** `serve` 启动时先做一次预热事务并重试，避免调用方
-   看到 `invalid DDC/CI length`。
-
-4. **不把"读回等于目标值"当成功判据。** 显示器切走后本机读不回来，那是**预期行为**。
-   `SwitchOutcome::verdict()` 明确把「写入被 ACK 但读不回」判为成功。
-
-5. **`hold` 是抢回显示器的关键。** 目标输入没有信号时显示器会自动回切，所以要周期
-   重发请求；一旦另一台机器停止驱动它的输入，显示器就会稳定停在 Mac 这一路。
-
-6. **DDC 写入被 ACK ≠ 显示器照做。** 所以措辞是 "sent / acknowledged"，不谎称已切换。
-
-架构分层：
-
-```
-dmux-gui (GPUI)  ─┐
-                  ├─→  displaymux::ddc  ─→  dmux-ddc-helper（一次性 / 常驻）
-dmux (CLI)       ─┘        │                        │
-                           │                        └─→ ddc-hi / ddc-macos
-                           └─ 超时、重试、切换裁决
-                                 displaymux::vcp ── VCP 值映射 + capabilities 解析
-```
-
-**GUI 侧线程模型**：`ddc::Reader` 持有 `std::process::Child`，因此**不是 `Send`**，
-必须整个活在专属工作线程里；UI 线程只通过 channel 通信，并用定时器轮询结果，
-**绝不阻塞在 DDC 调用上**（一次读要 120–200ms）。
-
----
-
-## 目录结构
-
-```
-src/
-  lib.rs                     crate 入口：导出下面三个模块
-  vcp.rs                     MCCS/VCP：输入源命名、capabilities 解析、别名解析
-  ddc.rs                     监督层：进程管理、超时、重试、切换裁决
-  tray.rs                    菜单栏常驻：状态项、菜单、点击派发
-  bin/
-    dmux.rs                  命令行界面
-    dmux-ddc-helper.rs       DDC 操作执行器（serve = 常驻只读模式）
-    dmux-gui.rs              GPUI 图形界面
-rust-toolchain.toml          锁定 Rust 1.99.0（gpui 1.24 需要新 std API）
-docs/hardware-notes.md       硬件实测笔记（改 ddc 层前必读）
-docs/gpui-versioning.md      gpui 版本策略与社区调研
-tools/memwatch.sh            测量进程内存峰值/稳态
-tools/mem-baseline.sh        更可信的内存口径（含 PID 身份校验）
-tools/recover-input.sh       切到无信号输入后，把显示器抢回来
-```
-
-### 菜单栏常驻
-
-`dmux-gui` 会在菜单栏放一个状态项，关掉窗口也继续运行（`QuitMode::Explicit`），
-菜单里可以直接切信号源：
-
-```
-R32U81 - 0x10 DisplayPort 2
-─────────────────────────────
-Refresh
-Reclaim DisplayPort 2
-DisplayPort 1
-✓ DisplayPort 2          ← 当前输入
-HDMI 1
-HDMI 2
-─────────────────────────────
-Show window
-Quit dmux
-```
-
-实现上有两个约束（都写在 [src/tray.rs](src/tray.rs) 里）：macOS 要求状态项在
-**主线程且事件循环已运行**时创建，所以它建在 GPUI 的 `run` 闭包内；`tray-icon`
-的点击走全局回调，因此转发进 channel、由 GPUI 定时器在**主线程**轮询，保证所有
-UI 变更都发生在 GPUI 线程上。
-
----
-
-## 平台支持
-
-| 平台 | 后端 | 状态 |
-|---|---|---|
-| macOS (Apple Silicon) | `ddc-macos` → 私有 `CoreDisplay`/`IOAVService` | ✅ 实测可用 |
-| macOS (Intel) | `ddc-macos` → `IOFramebufferI2CInterface` | 未验证 |
-| Windows | Monitor Configuration API（`SetVCPFeature`） | 未做 |
-| Linux | `ddcutil` / `/dev/i2c-*` | 未做 |
-
-「一次操作一个进程」和「预热」这两条补偿**只对 macOS 后端有意义**；Windows/Linux
-预期没有「写完即坏」的问题，加进后端层实现时不要无差别照搬（见 hardware-notes 第 5 节）。
-
-> macOS 上内建 HDMI 口在部分机型不支持 DDC（`ddc-macos` 与 `m1ddc` 都如此），
-> 外接显示器走 USB-C / DP 才可靠。
-
----
-
-## 开发
-
-```bash
-cargo test                     # VCP 解析与别名解析的单元测试
-cargo build --release --bin dmux
-cargo clippy --all-targets
-```
-
-### 构建 GPUI 的注意事项
-
-依赖在 **gpui 1.24** 上，用社区分发版 `gpui-unofficial`（按 Zed release tag
-自动同步发布），并**用 `=` 精确锁版本**——gpui 的 minor 号来自 Zed 的 release
-tag，**没有兼容性含义**：
+The GUI builds against GPUI 1.24 through the community release train
+`gpui-unofficial`, pinned with `=` because GPUI's minor version tracks Zed's
+release tags and carries no compatibility promise. Two features are load-bearing,
+and both live on `gpui_platform`:
 
 ```toml
-gpui = { package = "gpui-unofficial", version = "=1.24.1-pre", default-features = false, optional = true }
 gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.24.1-pre",
                   default-features = false, features = [
-    "font-kit",         # 否则 macOS 上完全没有文字
-    "runtime_shaders",  # macOS 没有完整 Xcode 时必需
-], optional = true }
+    "font-kit",         # without it macOS renders no text at all
+    "runtime_shaders",  # build without a full Xcode install
+] }
 ```
 
-三个容易踩的点：
+- **`font-kit`** belongs to GPUI's default feature set. Because we set
+  `default-features = false` (to reach `runtime_shaders`), it must be listed
+  explicitly. Omit it and the macOS backend falls back to `NoopTextSystem`:
+  layout, styling and font metrics all behave normally, and **not one glyph is
+  painted**. Zed hit the same trap in
+  [zed-industries/zed#59241](https://github.com/zed-industries/zed/pull/59241).
+  A quick check: `cargo tree -e normal | grep -c font-kit` returning `0` is the bug.
+- **`runtime_shaders`** has GPUI compile its Metal shaders at run time. Without it
+  the build calls `xcrun -sdk macosx metal`, which ships only with a full Xcode
+  installation; with it, the Command Line Tools suffice.
 
-- **两个 feature 都挂在 `gpui_platform` 上，不在 `gpui` 上。** 1.24 起平台后端
-  拆成了独立 crate，这两个 feature 都转发给 `gpui_macos`。
+## Command line
 
-- **`font-kit`**：它在 gpui 的 **default feature 集合**里，所以一旦写
-  `default-features = false` 就会被静默关掉，macOS 后端随即回落到
-  `NoopTextSystem` —— **窗口、布局、配色全部正常，但一个字形都不画**。
-  这个坑不会以编译错误或运行时报错的形式出现，Zed 官方也踩过
-  （[zed#59241](https://github.com/zed-industries/zed/pull/59241)）。
+```
+dmux list                              list DDC-capable displays
+dmux status [--index=N] [--caps]       ports, capabilities and latency
+dmux inputs [--index=N]                just the switchable inputs
+dmux set <input> [--index=N]           switch input
+dmux toggle [--index=N] [--to=<input>] switch to the next, or the given, input
+dmux hold <input> [--index=N]          re-assert an input until it sticks
+dmux bright <0-100> [--index=N]        set brightness
+```
 
-- **入口 API 变了**：`Application::new()` 已不存在，平台实例改为显式传入，
-  所以入口是 `gpui_platform::application().run(..)`。
+Inputs may be given as a VCP value (`0x11`, `17`) or by name with separators
+ignored: `hdmi1`, `HDMI-1`, `dp2`, `displayport2`, `usbc1`.
 
-> **排查口诀**：界面正常但没有文字 → 先跑
-> `cargo tree -e normal | grep -c font-kit`，`0` 就是病因。
+```console
+$ dmux status
+display   : [0] DELL U2720Q
+input     : 0x10 (DisplayPort 2)
+switchable:
+    0x0f     DisplayPort 1
+  * 0x10     DisplayPort 2
+    0x11     HDMI 1
+    0x12     HDMI 2
+latency   : 126 ms
 
-`rust-toolchain.toml` 锁了 **1.99.0**。这不是跟风：gpui 1.24 用到
-`slice_as_array` 等新 std API，旧工具链会直接编译失败。换 gpui 版本或改用
-fork 之前，请先读 [docs/gpui-versioning.md](docs/gpui-versioning.md)。
+$ dmux set hdmi1
+switching [0] to 0x11 (HDMI 1) ...
+result    : switch sent (monitor moved off this host, so no readback expected)
+```
 
-完整的实测记录见 [docs/hardware-notes.md](docs/hardware-notes.md#26-default-features--false-会静默关掉整个文字渲染)。
+`dmux hold` re-sends the request on an interval, which helps when the monitor
+would otherwise fall back to whichever input still carries a signal — for
+example while the other machine is shutting down.
 
----
+## Menu bar
 
-## 路线图
+Running `dmux-gui` installs a menu bar item. Closing its window does not quit the
+app: the menu is the primary interface, and `Quit dmux` is how you leave.
 
-- [ ] GPUI 界面闭环：端口列表、当前源高亮、切换、抢回
-- [x] 菜单栏常驻（托盘 + 菜单，可切源）
-- [ ] 全局快捷键
-- [ ] 「另一台机器关机就自动切回来」的自动策略（轮询 + hold）
-- [ ] Windows 后端
-- [ ] Linux 后端（ddcutil）
-- [ ] 内存/启动基准测试（`tools/memwatch.sh` 已就位）
+The rows are the inputs the monitor advertises. A row marked `last sent here`
+records a command this app issued; it is not a reading of the monitor.
 
-## 许可
+Devices attached behind the monitor's USB hub are used to tell whether the
+display is currently routed to this machine. That wiring is desk-specific, so it
+is opt-in:
 
-MIT，见 [LICENSE](LICENSE)。
+```bash
+export DMUX_DEVICE_HINTS="<substring>,<substring>"   # devices behind the monitor hub
+export DMUX_HUB_HINT="<substring>"                   # the monitor's hub itself
+```
+
+Without them the app reports the display state as unknown rather than guessing.
+
+## How it works
+
+```
+dmux-gui ─┐
+          ├─→ displaymux::ddc ─→ dmux-ddc-helper ─→ ddc-hi ─→ platform API
+dmux    ──┘        │
+                   └─ timeouts, retries, switch verdict
+                   displaymux::vcp ── VCP values and capabilities parsing
+```
+
+| Module | Responsibility |
+|---|---|
+| `vcp` | MCCS value naming, capabilities parsing, input specifier resolution |
+| `ddc` | Subprocess management, timeouts, retries, and the switch verdict |
+| `session` | Whether the display is routed here, from USB device presence |
+| `state` | The input this app last sent, persisted per display |
+| `tray` | Menu bar item and menu |
+
+`dmux-ddc-helper` performs exactly one DDC operation per invocation and exits.
+That is not incidental: on macOS, issuing a write leaves the channel unusable for
+further transactions from the same process, and a fresh process is the only
+recovery. Reads are safe to share, so they use a persistent `serve` mode instead,
+which also avoids paying process startup and device enumeration on every refresh.
+
+The helper warms the channel up before its handshake, because the first
+transaction on a freshly created handle reliably fails.
+
+## Limitations
+
+**A switch cannot be undone from the machine that issued it.** Once the display
+moves to another computer, that computer drives it — and if the keyboard and
+mouse are attached to the monitor's hub, they move with it. No hotkey can bring
+the display back; the monitor's own input menu is the way. Treat a switch as a
+deliberate, one-way action.
+
+What the tool therefore does *not* do:
+
+- It does not report which input the display is on. Some monitors return a
+  constant value for VCP `0x60` regardless of the selected input, so the readback
+  is not evidence. A wrong answer would be worse than none: it would aim a
+  "switch back" command at the other computer.
+- It does not verify that a switch happened. It reports that the monitor
+  acknowledged the command, which is all the host can honestly know.
+- It does not switch automatically.
+
+If a switch lands on an input with no signal, some monitors hold that input and
+display "no signal" rather than falling back. `tools/recover-input.sh` re-asserts
+a given input from fresh processes, but it can only help while the DDC channel is
+still alive.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

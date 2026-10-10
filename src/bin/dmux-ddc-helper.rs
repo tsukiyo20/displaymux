@@ -10,7 +10,7 @@
 //! Emits a single JSON object on stdout. Exit code 0 = operation completed as
 //! requested, 1 = DDC failure (details still in the JSON).
 //!
-//! HARD RULE derived from measurement on Apple Silicon (M4 + macOS 27):
+//! HARD RULE derived from measurement on Apple Silicon:
 //!
 //! * reading VCPs never breaks the DCP I2C channel -- 8/8 fresh-process reads
 //!   and 8/8 same-process reads succeeded, 45-96 ms each;

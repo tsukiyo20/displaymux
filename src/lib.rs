@@ -8,9 +8,15 @@
 //! * [`ddc`] - the supervisor: spawns the DDC helper, enforces timeouts, and
 //!   decides whether a switch actually happened.
 //!
-//! Everything the supervisor knows about the *hardware* (why a subprocess per
-//! write, why a persistent process for reads, why a switch cannot be verified on
-//! this host) is documented in `docs/hardware-notes.md`.
+//! Two properties of real DDC/CI hardware shape this design, and both are
+//! documented where they are implemented rather than assumed:
+//!
+//! * a write can leave the DDC channel unusable for the rest of that process,
+//!   which is why every write gets a throwaway process while reads share one
+//!   long-lived process ([`ddc`]);
+//! * a switch cannot be verified from the host that issued it, and some
+//!   monitors report a constant "current input" regardless of the truth, so the
+//!   UI reports intent rather than state ([`session`], [`state`]).
 
 pub mod ddc;
 pub mod session;

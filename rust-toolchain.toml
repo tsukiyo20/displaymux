@@ -1,6 +1,6 @@
-# Pinned to match the community convention (see docs/gpui-versioning.md).
-# gpui tracks Zed's release tags and is pre-1.0 with no compatibility promise,
-# so an unpinned toolchain turns upstream std-API churn into broken builds.
+# Pinned deliberately. gpui tracks Zed's release tags and is pre-1.0 with no
+# compatibility promise; the crates we depend on also use newly stabilised std
+# APIs, so an unpinned toolchain turns upstream churn into broken builds.
 [toolchain]
 channel = "1.99.0"
 components = ["cargo", "rustc", "rustfmt", "clippy", "rust-analyzer"]

@@ -35,26 +35,33 @@ ddc-hi = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# GPUI is only needed for the GUI bin, but Cargo features are per-crate rather
-# than per-bin, so it is marked optional and enabled by the `gui` feature.
-#
-# `font-kit` is NOT really optional, even though it looks like one. It lives in
-# gpui's default feature set, and building with `default-features = false`
-# (which we need in order to get `runtime_shaders`) silently drops it. On macOS
-# that makes `MacPlatform` fall back to `gpui::NoopTextSystem`: the window lays
-# out perfectly, font metrics still answer, and *no glyph is ever painted*.
-# Zed hit the same trap in its own `component_preview` example
-# (zed-industries/zed#59241). Keep `font-kit` in this list.
-gpui = { version = "0.2.2", default-features = false, features = [
-    "runtime_shaders",
+# GPUI, modern layout: `gpui` and `gpui_platform` are separate crates. Both
+# features we need hang off `gpui_platform`, NOT off `gpui`:
+#   * font-kit        -> real text on macOS. Without it the backend falls back
+#                        to NoopTextSystem: perfect layout, zero glyphs.
+#                        See docs/hardware-notes.md 2.6.
+#   * runtime_shaders -> compile Metal shaders at runtime, so building does not
+#                        require the `metal` binary that only ships with full
+#                        Xcode. See docs/hardware-notes.md 2.5.
+# Versions are pinned with `=` on purpose: gpui's minor number comes from Zed's
+# release tag and carries no compatibility meaning.
+gpui = { package = "gpui-unofficial", version = "=1.24.1-pre", default-features = false, optional = true }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.24.1-pre", default-features = false, features = [
     "font-kit",
+    "runtime_shaders",
 ], optional = true }
+
+# Tray icon. GPUI ships no tray API, so a resident switcher has to bring its
+# own; see docs/gpui-versioning.md.
+# Not optional: the tray lives in the library (src/tray.rs), not in the GUI
+# binary, so the CLI build links it too. It is small and pulls no GUI stack.
+tray-icon = "0.26"
 
 [features]
 default = []
 # `cargo build --features gui` builds dmux-gui. `runtime_shaders` is required on
 # macOS without full Xcode: see docs/hardware-notes.md.
-gui = ["dep:gpui"]
+gui = ["dep:gpui", "dep:gpui_platform"]
 
 [profile.release]
 lto = "thin"

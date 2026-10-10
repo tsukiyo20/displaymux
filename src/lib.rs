@@ -13,5 +13,7 @@
 //! this host) is documented in `docs/hardware-notes.md`.
 
 pub mod ddc;
+pub mod session;
+pub mod state;
 pub mod tray;
 pub mod vcp;

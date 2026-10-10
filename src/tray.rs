@@ -26,8 +26,6 @@ pub enum TrayEvent {
     Switch(String),
     /// Re-read the monitor and rebuild the menu.
     Refresh,
-    /// Re-assert the currently selected input until it sticks.
-    Reclaim,
     /// Show the main window.
     Show,
     Quit,
@@ -35,7 +33,6 @@ pub enum TrayEvent {
 
 const ID_SWITCH_PREFIX: &str = "input:";
 const ID_REFRESH: &str = "refresh";
-const ID_RECLAIM: &str = "reclaim";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
 const ID_HEADER: &str = "header";
@@ -91,7 +88,6 @@ pub struct Tray {
     /// Held so the status item stays alive; dropping it removes the icon.
     _icon: TrayIcon,
     header: MenuItem,
-    reclaim: MenuItem,
     show: MenuItem,
     /// Input rows, rebuilt whenever the advertised list changes.
     rows: Vec<(String, CheckMenuItem)>,
@@ -107,7 +103,6 @@ impl Tray {
 
         let header = MenuItem::with_id(ID_HEADER, "dmux: reading monitor...", false, None);
         let refresh = MenuItem::with_id(ID_REFRESH, "Refresh", true, None);
-        let reclaim = MenuItem::with_id(ID_RECLAIM, "Reclaim this input", false, None);
         let show = MenuItem::with_id(ID_SHOW, "Show window", true, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit dmux", true, None);
 
@@ -116,7 +111,6 @@ impl Tray {
             &header,
             &PredefinedMenuItem::separator(),
             &refresh,
-            &reclaim,
             &PredefinedMenuItem::separator(),
             &show,
             &quit,
@@ -147,7 +141,6 @@ impl Tray {
         Some(Tray {
             _icon: icon,
             header,
-            reclaim,
             show,
             rows: Vec::new(),
             menu,
@@ -171,15 +164,14 @@ impl Tray {
         inputs: &[(String, String, bool)],
     ) {
         match current {
+            // The header states what we last asked for, never what the monitor
+            // claims: on the reference monitor VCP 0x60 does not follow the
+            // actual input, and a wrong "you are here" is worse than none.
             Some((code, name)) => {
-                self.header.set_text(format!("{display} - {code} {name}"));
-                self.reclaim.set_enabled(true);
-                self.reclaim.set_text(format!("Reclaim {name}"));
+                self.header.set_text(format!("{display} - last sent: {code} {name}"));
             }
             None => {
-                self.header.set_text(format!("{display} - input unknown"));
-                self.reclaim.set_enabled(false);
-                self.reclaim.set_text("Reclaim this input");
+                self.header.set_text(format!("{display} - no input sent yet"));
             }
         }
         self.show.set_text("Show window");
@@ -234,7 +226,6 @@ fn forward_events(tx: Sender<TrayEvent>) {
         } else {
             match id {
                 ID_REFRESH => Some(TrayEvent::Refresh),
-                ID_RECLAIM => Some(TrayEvent::Reclaim),
                 ID_SHOW => Some(TrayEvent::Show),
                 ID_QUIT => Some(TrayEvent::Quit),
                 _ => None,

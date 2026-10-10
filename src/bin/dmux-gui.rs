@@ -44,6 +44,8 @@ fn main() {
 #[cfg(feature = "gui")]
 mod gui {
     use displaymux::ddc::{self, Status};
+    use displaymux::session::{self, Session};
+    use displaymux::state::State;
     use displaymux::tray::{Tray, TrayEvent};
     use gpui::{
         div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, IntoElement, QuitMode,
@@ -51,26 +53,27 @@ mod gui {
     };
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const READ_TIMEOUT: Duration = Duration::from_secs(12);
     const POLL_INTERVAL: Duration = Duration::from_millis(60);
     /// Tray clicks are checked on a timer; the menu bar is a secondary surface
     /// so a leisurely poll is fine and keeps everything on the GPUI thread.
     const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(120);
+    /// How often the USB tree is inspected for the "on screen?" signal. Cheap
+    /// enough at this rate, and a switch takes about this long to settle anyway.
+    const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
     #[derive(Debug)]
     enum Request {
         Refresh,
         Switch { index: usize, code: String },
-        Reclaim { index: usize, code: String, every: Duration, up_to: Duration },
     }
 
     #[derive(Debug)]
     enum Response {
         Status(Box<Result<Status, String>>),
         Switched(Box<Result<String, String>>),
-        Reclaim(Box<Result<String, String>>),
     }
 
     /// Owns the DDC reader and performs every DDC call off the UI thread.
@@ -136,61 +139,12 @@ mod gui {
                                     break;
                                 }
                             }
-                            Request::Reclaim { index, code, every, up_to } => {
-                                let out = reclaim(index, &code, every, up_to, &mut reader)
-                                    .map_err(|e| e.to_string());
-                                reader = None;
-                                if res_tx.send(Response::Reclaim(Box::new(out))).is_err() {
-                                    break;
-                                }
-                            }
                         }
                     }
                 })
                 .expect("spawn ddc worker");
 
             Worker { tx: req_tx, rx: Arc::new(Mutex::new(res_rx)) }
-        }
-    }
-
-    /// Re-assert `code` every `every` until this host is selected again, or
-    /// `up_to` elapses.
-    ///
-    /// This is what lets the Mac take the monitor back from the other machine:
-    /// DDC stays reachable while the monitor displays someone else, so repeating
-    /// the request wins as soon as the other input stops being driven.
-    fn reclaim(
-        index: usize,
-        code: &str,
-        every: Duration,
-        up_to: Duration,
-        reader: &mut Option<ddc::Reader>,
-    ) -> Result<String, ddc::DdcError> {
-        let start = Instant::now();
-        let mut attempts = 0u32;
-        loop {
-            attempts += 1;
-            if reader.is_none() {
-                *reader = ddc::Reader::spawn().ok();
-            }
-            let already = reader
-                .as_mut()
-                .and_then(|r| r.status(index, READ_TIMEOUT).ok())
-                .and_then(|s| s.current_input)
-                .map(|c| c.eq_ignore_ascii_case(code))
-                .unwrap_or(false);
-            if already {
-                return Ok(format!("already on {} after {} probe(s)", code, attempts));
-            }
-            ddc::set_input(index, code, READ_TIMEOUT)?;
-            if start.elapsed() >= up_to {
-                return Ok(format!(
-                    "gave up after {} attempt(s) / {}s",
-                    attempts,
-                    start.elapsed().as_secs()
-                ));
-            }
-            std::thread::sleep(every);
         }
     }
 
@@ -203,6 +157,18 @@ mod gui {
         /// `None` when the status item could not be created; the window then
         /// remains the only interface.
         tray: Option<Tray>,
+        /// Persisted "where is this host plugged in" knowledge. Authoritative
+        /// over the monitor's readback, which is unreliable on some monitors
+        /// (see `displaymux::state`).
+        state: State,
+        /// The input we last switched to. Used only to mark a row as "you sent
+        /// the display here"; it is *not* a claim about the monitor's state.
+        current: Option<String>,
+        /// Whether the monitor is routed to this host, measured from USB device
+        /// presence rather than asked of the monitor. See `displaymux::session`.
+        session: Session,
+        /// The target of an in-flight switch, remembered once it is accepted.
+        pending_input: Option<String>,
     }
 
     impl SwitchApp {
@@ -216,9 +182,40 @@ mod gui {
                 busy: true,
                 index: 0,
                 tray: None,
+                state: State::load(),
+                current: None,
+                session: session::current(),
+                pending_input: None,
             };
             app.poll(cx);
+            app.poll_session(cx);
             app
+        }
+
+        /// Re-read the USB-based "is this host on screen?" signal on a timer.
+        ///
+        /// This is the honest replacement for asking the monitor which input it
+        /// is on: the keyboard and mouse sit behind the monitor's hub, so their
+        /// presence is evidence, not a claim.
+        fn poll_session(&self, cx: &mut Context<Self>) {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(SESSION_POLL_INTERVAL).await;
+                let now = session::current();
+                let changed = this
+                    .update(cx, |app, _| {
+                        let changed = app.session != now;
+                        app.session = now;
+                        changed
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    let _ = this.update(cx, |app, cx| {
+                        app.sync_tray();
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
         }
 
         /// Attach the menu bar item and start listening to it.
@@ -236,25 +233,33 @@ mod gui {
                 .as_ref()
                 .map(|s| s.display_id.clone())
                 .unwrap_or_else(|| "no DDC monitor".to_string());
-            let current = self
-                .status
-                .as_ref()
-                .and_then(|s| s.current_input.clone())
-                .map(|code| {
-                    let name = self
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.current_input_name.clone())
-                        .unwrap_or_default();
-                    (code, name)
-                });
+            let current = self.current.clone().map(|code| {
+                let name = self
+                    .status
+                    .as_ref()
+                    .and_then(|s| {
+                        s.inputs
+                            .iter()
+                            .find(|i| i.code.eq_ignore_ascii_case(&code))
+                            .map(|i| i.name.clone())
+                    })
+                    .unwrap_or_else(|| code.clone());
+                (code, name)
+            });
             let inputs: Vec<(String, String, bool)> = self
                 .status
                 .as_ref()
                 .map(|s| {
                     s.inputs
                         .iter()
-                        .map(|i| (i.code.clone(), i.name.clone(), i.current))
+                        .map(|i| {
+                            let is_current = self
+                                .current
+                                .as_deref()
+                                .map(|c| c.eq_ignore_ascii_case(&i.code))
+                                .unwrap_or(i.current);
+                            (i.code.clone(), i.name.clone(), is_current)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -300,26 +305,13 @@ mod gui {
                     return true;
                 }
                 TrayEvent::Refresh => self.send(Request::Refresh, "reading monitor state...", cx),
-                TrayEvent::Switch(code) => self.send(
-                    Request::Switch { index: self.index, code: code.clone() },
-                    format!("switching to {}...", code),
-                    cx,
-                ),
-                TrayEvent::Reclaim => {
-                    let Some(code) = self.status.as_ref().and_then(|s| s.current_input.clone())
-                    else {
-                        return true;
-                    };
+                TrayEvent::Switch(code) => {
+                    self.pending_input = Some(code.clone());
                     self.send(
-                        Request::Reclaim {
-                            index: self.index,
-                            code: code.clone(),
-                            every: Duration::from_secs(2),
-                            up_to: Duration::from_secs(20),
-                        },
-                        "reclaiming...",
+                        Request::Switch { index: self.index, code: code.clone() },
+                        format!("switching to {}...", code),
                         cx,
-                    );
+                    )
                 }
             }
             true
@@ -363,33 +355,65 @@ mod gui {
             match resp {
                 Response::Status(st) => match *st {
                     Ok(s) => {
-                        self.message = match (&s.current_input, &s.current_input_name) {
-                            (Some(c), Some(n)) => format!("current input {} ({})", c, n).into(),
-                            _ => s
-                                .read_error
-                                .clone()
-                                .map(|e| format!("monitor not answering: {}", e).into())
-                                .unwrap_or_else(|| "monitor not answering".into()),
+                        // Report only what we can stand behind. The monitor's
+                        // VCP 0x60 value is not shown as "current input" because
+                        // on the reference monitor it is a constant that does not
+                        // follow the actual input; the honest state comes from
+                        // the USB-based banner above.
+                        self.message = if s.inputs.is_empty() {
+                            "monitor did not report any switchable inputs".into()
+                        } else {
+                            format!("{} inputs available", s.inputs.len()).into()
                         };
                         if !s.inputs.is_empty() {
                             self.index = s.display_index;
                         }
+                        // Deliberately *not* taking the monitor's VCP 0x60 as
+                        // "where we are": on the reference monitor it reports a
+                        // constant value regardless of the actual input.
+                        let remembered = self.state.last_input(&s.display_id).map(|c| c.to_string());
+                        self.current = remembered;
                         self.status = Some(s);
                     }
                     Err(e) => self.message = format!("read failed: {}", e).into(),
                 },
-                Response::Switched(r) => {
-                    self.message = match *r {
-                        Ok(v) => v.into(),
-                        Err(e) => format!("switch failed: {}", e).into(),
+                Response::Switched(r) => match *r {
+                    Ok(verdict) => {
+                        // The write was accepted. That is all we can honestly
+                        // claim: whether the monitor acted on it is not knowable
+                        // from here, and once it does act, this host loses the
+                        // display entirely.
+                        if let (Some(code), Some(id)) = (
+                            self.pending_input.take(),
+                            self.status.as_ref().map(|s| s.display_id.clone()),
+                        ) {
+                            let mut text = verdict;
+                            if let Some(back) = self
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.current_input.clone())
+                            {
+                                if !back.eq_ignore_ascii_case(&code) {
+                                    // A write that does not move the reported
+                                    // value is the signature of a monitor whose
+                                    // VCP 0x60 does not follow the input, so say
+                                    // so instead of implying it lied about ours.
+                                    text = format!(
+                                        "command sent for {} (monitor still reports {} for VCP 0x60)",
+                                        code, back
+                                    );
+                                }
+                            }
+                            self.state.remember_input(&id, &code);
+                            self.state.save();
+                            self.current = Some(code);
+                            self.message = text.into();
+                        } else {
+                            self.message = verdict.into();
+                        }
                     }
-                }
-                Response::Reclaim(r) => {
-                    self.message = match *r {
-                        Ok(v) => v.into(),
-                        Err(e) => format!("reclaim failed: {}", e).into(),
-                    }
-                }
+                    Err(e) => self.message = format!("switch failed: {}", e).into(),
+                },
             }
             self.sync_tray();
         }
@@ -441,9 +465,9 @@ mod gui {
                     }),
             )
             .child(if current {
-                div().text_color(rgb(0x8fdf8f)).child("current").into_any_element()
+                div().text_color(rgb(0xa8a8b0)).child("last sent here").into_any_element()
             } else {
-                div().text_color(rgb(0x6a6a72)).child("switch").into_any_element()
+                div().text_color(rgb(0x8ab4f8)).child("switch").into_any_element()
             })
             .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
                 let code = code_for_click.clone();
@@ -467,8 +491,9 @@ mod gui {
             let busy = self.busy;
             let message = self.message.clone();
             let weak = cx.entity().downgrade();
-            let weak_reclaim = weak.clone();
+            let session = self.session;
 
+            let current = self.current.clone();
             let rows: Vec<gpui::AnyElement> = self
                 .status
                 .as_ref()
@@ -476,10 +501,14 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
+                            let is_current = current
+                                .as_deref()
+                                .map(|c| c.eq_ignore_ascii_case(&i.code))
+                                .unwrap_or(i.current);
                             input_row(
                                 i.code.clone(),
                                 i.name.clone(),
-                                i.current,
+                                is_current,
                                 i.advertised,
                                 weak.clone(),
                             )
@@ -489,11 +518,6 @@ mod gui {
                 })
                 .unwrap_or_default();
 
-            let current_code = self
-                .status
-                .as_ref()
-                .and_then(|s| s.current_input.clone())
-                .unwrap_or_default();
 
             div()
                 .flex()
@@ -534,44 +558,27 @@ mod gui {
                                 }),
                         ),
                 )
-                .child(div().flex().flex_col().gap_1().children(rows))
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id("reclaim")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x2f2f38))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3d3d48)))
-                                .child("reclaim this input")
-                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                    let code = current_code.clone();
-                                    let _ = weak_reclaim.update(cx, |app: &mut SwitchApp, cx| {
-                                        if code.is_empty() {
-                                            app.message = "no current input known yet".into();
-                                            cx.notify();
-                                            return;
-                                        }
-                                        app.send(
-                                            Request::Reclaim {
-                                                index: app.index,
-                                                code: code.clone(),
-                                                every: Duration::from_secs(2),
-                                                up_to: Duration::from_secs(20),
-                                            },
-                                            "reclaiming...",
-                                            cx,
-                                        );
-                                    });
-                                }),
-                        ),
+                        .text_sm()
+                        .text_color(match session {
+                            Session::Visible => rgb(0x8fdf8f),
+                            Session::SwitchedAway => rgb(0xe0a060),
+                            Session::Unknown => rgb(0x8a8a90),
+                        })
+                        .child(match session {
+                            Session::Visible => {
+                                "This display is showing this computer (keyboard and mouse present)"
+                            }
+                            Session::SwitchedAway => {
+                                "This display has switched away - the only way back is the monitor's own input menu"
+                            }
+                            Session::Unknown => {
+                                "Display state unknown (peripherals are not behind the monitor)"
+                            }
+                        }),
                 )
+                .child(div().flex().flex_col().gap_1().children(rows))
                 .child(
                     div()
                         .mt_auto()

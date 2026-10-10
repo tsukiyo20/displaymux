@@ -1,0 +1,50 @@
+[package]
+name = "displaymux"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Lightweight cross-platform tool to switch a monitor's input source (DDC/CI)"
+license = "MIT"
+repository = "https://github.com/ecluna/displaymux"
+keywords = ["ddc", "ddc-ci", "monitor", "kvm", "gpui"]
+categories = ["hardware-support", "gui"]
+
+[lib]
+name = "displaymux"
+path = "src/lib.rs"
+
+# Human-facing CLI. Shipped name is short even though the crate is descriptive.
+[[bin]]
+name = "dmux"
+path = "src/bin/dmux.rs"
+
+# One-shot, one-operation-per-process DDC helper. Never meant to be run by hand
+# except for debugging; `dmux` and the GUI both spawn it.
+[[bin]]
+name = "dmux-ddc-helper"
+path = "src/bin/dmux-ddc-helper.rs"
+
+# GPUI desktop front end. Built separately from the CLI so that a headless or
+# non-GUI build does not need the (large) GUI dependency tree.
+[[bin]]
+name = "dmux-gui"
+path = "src/bin/dmux-gui.rs"
+
+[dependencies]
+ddc-hi = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# GPUI is only needed for the GUI bin, but Cargo features are per-crate rather
+# than per-bin; the extra trees are marked optional below where possible.
+gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders"], optional = true }
+
+[features]
+default = []
+# `cargo build --features gui` builds dmux-gui. `runtime_shaders` is required on
+# macOS without full Xcode: see docs/hardware-notes.md.
+gui = ["dep:gpui"]
+
+[profile.release]
+lto = "thin"
+strip = true

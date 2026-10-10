@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+._*
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# scratch
+/tmp/
+*.log

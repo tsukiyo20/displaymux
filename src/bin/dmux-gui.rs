@@ -1,0 +1,442 @@
+//! dmux-gui - GPUI front end for the monitor input switcher.
+//!
+//! This binary is gated behind the `gui` feature so that the CLI (and plain
+//! `cargo test`) do not pull in GPUI's ~700-crate dependency tree:
+//!
+//!     cargo build --release --features gui --bin dmux-gui
+//!
+//! Without the feature this file compiles to a stub that explains itself.
+
+#[cfg(not(feature = "gui"))]
+fn main() {
+    eprintln!(
+        "dmux-gui was built without the GPUI front end.\n\
+         Build it with:\n\
+         \n\
+         \tcargo build --release --features gui --bin dmux-gui\n"
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "gui")]
+mod gui {
+    use gpui::{
+        div, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent, Context, IntoElement,
+        MouseButton, SharedString, Window, WindowBounds, WindowOptions,
+    };
+    use displaymux::ddc::{self, Status};
+    use displaymux::vcp;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const READ_TIMEOUT: Duration = Duration::from_secs(12);
+
+    #[derive(Debug)]
+    enum Request {
+        Refresh { caps: bool },
+        Switch { index: usize, code: String },
+        Reclaim { index: usize, code: String, every: Duration, up_to: Duration },
+    }
+
+    #[derive(Debug)]
+    enum Response {
+        Status(Box<Result<Status, String>>),
+        Switched(Box<Result<String, String>>),
+        Reclaim(Box<Result<String, String>>),
+    }
+
+    /// Owns the DDC reader and performs all DDC work off the UI thread.
+    struct Worker {
+        tx: Sender<Request>,
+        /// Shared so the polling future can own a handle without borrowing `self`.
+        /// (GPUI's `spawn` needs a `'static` future; this keeps it free of unsafe.)
+        rx: Arc<Mutex<Receiver<Response>>>,
+    }
+
+    impl Worker {
+        fn spawn() -> Worker {
+            let (req_tx, req_rx) = channel::<Request>();
+            let (res_tx, res_rx) = channel::<Response>();
+
+            std::thread::Builder::new()
+                .name("ddc-worker".into())
+                .spawn(move || {
+                    // Reader is created inside the thread: it is !Send.
+                    let mut reader: Option<ddc::Reader> = None;
+                    let mut ensure = |r: &mut Option<ddc::Reader>| -> Result<(), String> {
+                        if r.is_none() {
+                            *r = Some(ddc::Reader::spawn().map_err(|e| e.to_string())?);
+                        }
+                        Ok(())
+                    };
+
+                    while let Ok(req) = req_rx.recv() {
+                        match req {
+                            Request::Refresh { caps } => {
+                                let _ = caps;
+                                let out = ensure(&mut reader)
+                                    .and_then(|_| {
+                                        reader
+                                            .as_mut()
+                                            .unwrap()
+                                            .status(0, READ_TIMEOUT)
+                                            .map_err(|e| e.to_string())
+                                    });
+                                if out.is_err() {
+                                    // A dead reader is replaced on the next request.
+                                    reader = None;
+                                }
+                                if res_tx.send(Response::Status(Box::new(out))).is_err() {
+                                    break;
+                                }
+                            }
+                            Request::Switch { index, code } => {
+                                let out = ddc::set_input(index, &code, READ_TIMEOUT)
+                                    .map(|o| o.verdict().to_string())
+                                    .map_err(|e| e.to_string());
+                                // The old reader's IOAVService may have been invalidated
+                                // by the switch; force a fresh one.
+                                reader = None;
+                                if res_tx.send(Response::Switched(Box::new(out))).is_err() {
+                                    break;
+                                }
+                            }
+                            Request::Reclaim { index, code, every, up_to } => {
+                                let out = reclaim(index, &code, every, up_to, &mut reader)
+                                    .map_err(|e| e.to_string());
+                                reader = None;
+                                if res_tx.send(Response::Reclaim(Box::new(out))).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .expect("spawn ddc worker");
+
+            Worker { tx: req_tx, rx: Arc::new(Mutex::new(res_rx)) }
+        }
+    }
+
+    /// Re-assert `code` until this host is selected again (or time runs out).
+    ///
+    /// This is what lets a Mac take the monitor back from the other machine: DDC
+    /// stays reachable while the monitor displays someone else, so repeating the
+    /// request eventually wins once the other input goes idle.
+    fn reclaim(
+        index: usize,
+        code: &str,
+        every: Duration,
+        up_to: Duration,
+        reader: &mut Option<ddc::Reader>,
+    ) -> Result<String, ddc::DdcError> {
+        let start = std::time::Instant::now();
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            if reader.is_none() {
+                *reader = ddc::Reader::spawn().ok();
+            }
+            let already = reader
+                .as_mut()
+                .and_then(|r| r.status(index, READ_TIMEOUT).ok())
+                .and_then(|s| s.current_input)
+                .map(|c| c.eq_ignore_ascii_case(code))
+                .unwrap_or(false);
+            if already {
+                return Ok(format!("reclaimed after {} attempt(s)", attempts));
+            }
+            ddc::set_input(index, code, READ_TIMEOUT)?;
+            if start.elapsed() >= up_to {
+                return Ok(format!("gave up after {} attempt(s), {}s", attempts, start.elapsed().as_secs()));
+            }
+            std::thread::sleep(every);
+        }
+    }
+
+    struct SwitchApp {
+        worker: Worker,
+        status: Option<Status>,
+        message: SharedString,
+        busy: bool,
+        index: usize,
+    }
+
+    impl SwitchApp {
+        fn new(cx: &mut Context<Self>) -> Self {
+            let worker = Worker::spawn();
+            let _ = worker.tx.send(Request::Refresh { caps: true });
+            let app = SwitchApp {
+                worker,
+                status: None,
+                message: "reading monitor state...".into(),
+                busy: true,
+                index: 0,
+            };
+            app.poll(cx);
+            app
+        }
+
+        /// Poll the worker's response channel on a timer, so the UI thread never
+        /// blocks on DDC. This is the "async without async" bridge to the worker.
+        fn poll(&self, cx: &mut Context<Self>) {
+            let rx = self.worker.rx.clone();
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(60)).await;
+                    let got = rx.lock().ok().map(|r| r.try_recv());
+                    match got {
+                        Some(Ok(resp)) => {
+                            let _ = this.update(cx, |app, cx| {
+                                app.apply(resp);
+                                cx.notify();
+                            });
+                            break;
+                        }
+                        Some(Err(std::sync::mpsc::TryRecvError::Empty)) => continue,
+                        // disconnected or poisoned: stop polling
+                        _ => break,
+                    }
+                }
+            })
+            .detach();
+        }
+
+        fn apply(&mut self, resp: Response) {
+            self.busy = false;
+            match resp {
+                Response::Status(st) => match *st {
+                    Ok(s) => {
+                        self.message = match (&s.current_input, &s.current_input_name) {
+                            (Some(c), Some(n)) => format!("current input {} ({})", c, n).into(),
+                            _ => s
+                                .read_error
+                                .clone()
+                                .map(|e| format!("monitor not answering: {}", e).into())
+                                .unwrap_or_else(|| "monitor not answering".into()),
+                        };
+                        self.status = Some(s);
+                    }
+                    Err(e) => self.message = format!("read failed: {}", e).into(),
+                },
+                Response::Switched(r) => {
+                    self.message = match *r {
+                        Ok(v) => v.into(),
+                        Err(e) => format!("switch failed: {}", e).into(),
+                    }
+                }
+                Response::Reclaim(r) => {
+                    self.message = match *r {
+                        Ok(v) => v.into(),
+                        Err(e) => format!("reclaim failed: {}", e).into(),
+                    }
+                }
+            }
+        }
+
+        fn send(&mut self, req: Request, note: &str, cx: &mut Context<Self>) {
+            if self.busy {
+                return;
+            }
+            self.busy = true;
+            self.message = note.into();
+            let _ = self.worker.tx.send(req);
+            self.poll(cx);
+            cx.notify();
+        }
+    }
+
+    fn input_row(
+        code: String,
+        name: String,
+        current: bool,
+        advertised: bool,
+        app: gpui::WeakEntity<SwitchApp>,
+    ) -> impl IntoElement {
+        let row_bg = if current { rgb(0x2d4f7c) } else { rgb(0x26262e) };
+        let code_for_click = code.clone();
+        div()
+            .id(SharedString::from(format!("input-{}", code)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(row_bg)
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x3a3a46)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_color(rgb(0x8ab4f8)).child(code.clone()))
+                    .child(div().text_color(rgb(0xe6e6e6)).child(name))
+                    .when(!advertised, |d| {
+                        d.child(div().text_color(rgb(0x8a8a90)).text_sm().child("unlisted"))
+                    }),
+            )
+            .child(if current {
+                div().text_color(rgb(0x8fdf8f)).child("current").into_any_element()
+            } else {
+                div().text_color(rgb(0x6a6a72)).child("switch").into_any_element()
+            })
+            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                let code = code_for_click.clone();
+                let _ = app.update(cx, |app: &mut SwitchApp, cx| {
+                    app.send(
+                        Request::Switch { index: app.index, code: code.clone() },
+                        &format!("switching to {}...", code),
+                        cx,
+                    );
+                });
+            })
+    }
+
+    impl Render for SwitchApp {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let title = self
+                .status
+                .as_ref()
+                .map(|s| s.display_id.clone())
+                .unwrap_or_else(|| "no monitor".into());
+            let busy = self.busy;
+            let message = self.message.clone();
+            let weak = cx.entity().downgrade();
+            let weak_reclaim = weak.clone();
+
+            let rows: Vec<gpui::AnyElement> = self
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.inputs
+                        .iter()
+                        .map(|i| {
+                            input_row(
+                                i.code.clone(),
+                                i.name.clone(),
+                                i.current,
+                                i.advertised,
+                                weak.clone(),
+                            )
+                            .into_any_element()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let current_code = self
+                .status
+                .as_ref()
+                .and_then(|s| s.current_input.clone())
+                .unwrap_or_default();
+
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .bg(rgb(0x1b1b20))
+                .size_full()
+                .p_3()
+                .text_color(rgb(0xe6e6e6))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(div().text_lg().child(title))
+                        .child(
+                            div()
+                                .id("refresh")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f2f38))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3d3d48)))
+                                .child(if busy { "working..." } else { "refresh" })
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                            app.send(
+                                                Request::Refresh { caps: true },
+                                                "reading monitor state...",
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .child(div().flex().flex_col().gap_1().children(rows))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("reclaim")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f2f38))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3d3d48)))
+                                .child("reclaim this input")
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let code = current_code.clone();
+                                    let _ = weak_reclaim.update(cx, |app: &mut SwitchApp, cx| {
+                                        if code.is_empty() {
+                                            app.message = "no current input known yet".into();
+                                            cx.notify();
+                                            return;
+                                        }
+                                        app.send(
+                                            Request::Reclaim {
+                                                index: app.index,
+                                                code: code.clone(),
+                                                every: Duration::from_secs(2),
+                                                up_to: Duration::from_secs(20),
+                                            },
+                                            "reclaiming...",
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt_auto()
+                        .text_sm()
+                        .text_color(rgb(0x9a9aa2))
+                        .child(message),
+                )
+        }
+    }
+
+    fn main() {
+        Application::new().run(|cx: &mut App| {
+            let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| SwitchApp::new(cx)),
+            )
+            .expect("open window");
+            cx.activate(true);
+            let _ = vcp::fallback_inputs();
+            let _ = MouseButton::Left;
+        });
+    }
+}

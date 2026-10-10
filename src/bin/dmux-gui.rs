@@ -44,9 +44,10 @@ fn main() {
 #[cfg(feature = "gui")]
 mod gui {
     use displaymux::ddc::{self, Status};
+    use displaymux::tray::{Tray, TrayEvent};
     use gpui::{
-        div, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent, Context,
-        IntoElement, SharedString, Window, WindowBounds, WindowOptions,
+        div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, IntoElement, QuitMode,
+        SharedString, Window, WindowBounds, WindowOptions,
     };
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -54,6 +55,9 @@ mod gui {
 
     const READ_TIMEOUT: Duration = Duration::from_secs(12);
     const POLL_INTERVAL: Duration = Duration::from_millis(60);
+    /// Tray clicks are checked on a timer; the menu bar is a secondary surface
+    /// so a leisurely poll is fine and keeps everything on the GPUI thread.
+    const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
     #[derive(Debug)]
     enum Request {
@@ -92,16 +96,29 @@ mod gui {
                     while let Ok(req) = req_rx.recv() {
                         match req {
                             Request::Refresh => {
-                                let out = match reader.get_or_insert_with(|| {
-                                    ddc::Reader::spawn().expect("spawn ddc reader")
-                                }).status(0, READ_TIMEOUT) {
-                                    Ok(st) => Ok(st),
-                                    Err(e) => {
-                                        // Drop it: the next request builds a fresh
-                                        // IOAVService, the only way to recover a
-                                        // wedged channel.
-                                        reader = None;
-                                        Err(e.to_string())
+                                // Never panic here: a missing helper used to abort
+                                // the worker, after which the UI waited on a
+                                // channel nobody would ever answer and sat on
+                                // "working..." forever.
+                                let out = match ddc::Reader::spawn() {
+                                    Err(e) if reader.is_none() => Err(e.to_string()),
+                                    _ => {
+                                        if reader.is_none() {
+                                            reader = ddc::Reader::spawn().ok();
+                                        }
+                                        match reader.as_mut() {
+                                            None => Err("DDC reader unavailable".to_string()),
+                                            Some(r) => match r.status(0, READ_TIMEOUT) {
+                                                Ok(st) => Ok(st),
+                                                Err(e) => {
+                                                    // Drop it: the next request builds
+                                                    // a fresh IOAVService, the only
+                                                    // way to recover a wedged channel.
+                                                    reader = None;
+                                                    Err(e.to_string())
+                                                }
+                                            },
+                                        }
                                     }
                                 };
                                 if res_tx.send(Response::Status(Box::new(out))).is_err() {
@@ -183,6 +200,9 @@ mod gui {
         message: SharedString,
         busy: bool,
         index: usize,
+        /// `None` when the status item could not be created; the window then
+        /// remains the only interface.
+        tray: Option<Tray>,
     }
 
     impl SwitchApp {
@@ -195,9 +215,114 @@ mod gui {
                 message: "reading monitor state...".into(),
                 busy: true,
                 index: 0,
+                tray: None,
             };
             app.poll(cx);
             app
+        }
+
+        /// Attach the menu bar item and start listening to it.
+        fn attach_tray(&mut self, tray: Tray, cx: &mut Context<Self>) {
+            self.tray = Some(tray);
+            self.sync_tray();
+            self.poll_tray(cx);
+        }
+
+        /// Push current state into the menu bar menu.
+        fn sync_tray(&mut self) {
+            let Some(tray) = self.tray.as_mut() else { return };
+            let display = self
+                .status
+                .as_ref()
+                .map(|s| s.display_id.clone())
+                .unwrap_or_else(|| "no DDC monitor".to_string());
+            let current = self
+                .status
+                .as_ref()
+                .and_then(|s| s.current_input.clone())
+                .map(|code| {
+                    let name = self
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.current_input_name.clone())
+                        .unwrap_or_default();
+                    (code, name)
+                });
+            let inputs: Vec<(String, String, bool)> = self
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.inputs
+                        .iter()
+                        .map(|i| (i.code.clone(), i.name.clone(), i.current))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tray.update(
+                &display,
+                current.as_ref().map(|(c, n)| (c.as_str(), n.as_str())),
+                &inputs,
+            );
+        }
+
+        /// Poll tray clicks on a timer, on the GPUI thread.
+        fn poll_tray(&self, cx: &mut Context<Self>) {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(TRAY_POLL_INTERVAL).await;
+                let event = this.update(cx, |app, _| {
+                    app.tray.as_ref().and_then(|t| t.try_recv())
+                });
+                match event {
+                    Ok(Some(event)) => {
+                        if !this
+                            .update(cx, |app, cx| app.handle_tray(event, cx))
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            })
+            .detach();
+        }
+
+        /// Returns `false` when the app should stop polling (quit).
+        fn handle_tray(&mut self, event: TrayEvent, cx: &mut Context<Self>) -> bool {
+            match event {
+                TrayEvent::Quit => {
+                    cx.quit();
+                    return false;
+                }
+                TrayEvent::Show => {
+                    cx.activate(true);
+                    return true;
+                }
+                TrayEvent::Refresh => self.send(Request::Refresh, "reading monitor state...", cx),
+                TrayEvent::Switch(code) => self.send(
+                    Request::Switch { index: self.index, code: code.clone() },
+                    format!("switching to {}...", code),
+                    cx,
+                ),
+                TrayEvent::Reclaim => {
+                    let Some(code) = self.status.as_ref().and_then(|s| s.current_input.clone())
+                    else {
+                        return true;
+                    };
+                    self.send(
+                        Request::Reclaim {
+                            index: self.index,
+                            code: code.clone(),
+                            every: Duration::from_secs(2),
+                            up_to: Duration::from_secs(20),
+                        },
+                        "reclaiming...",
+                        cx,
+                    );
+                }
+            }
+            true
         }
 
         /// Poll the worker's response channel on a timer, so the UI thread never
@@ -217,8 +342,16 @@ mod gui {
                             break;
                         }
                         Some(Err(std::sync::mpsc::TryRecvError::Empty)) => continue,
-                        // Disconnected or poisoned: stop polling.
-                        _ => break,
+                        // The worker died without answering. Clear `busy` so the
+                        // UI does not sit on "working..." forever.
+                        _ => {
+                            let _ = this.update(cx, |app, cx| {
+                                app.busy = false;
+                                app.message = "DDC worker stopped unexpectedly".into();
+                                cx.notify();
+                            });
+                            break;
+                        }
                     }
                 }
             })
@@ -258,6 +391,7 @@ mod gui {
                     }
                 }
             }
+            self.sync_tray();
         }
 
         fn send(&mut self, req: Request, note: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -449,16 +583,35 @@ mod gui {
     }
 
     pub fn run() {
-        Application::new().run(|cx: &mut App| {
+        // Modern entry point: the platform backends live in `gpui_platform`, and
+        // the platform instance is now passed in explicitly rather than created
+        // implicitly by `Application::new()`.
+        gpui_platform::application().run(|cx: &mut App| {
+            // A menu bar app must outlive its window; closing the window is not
+            // a request to exit. `TrayEvent::Quit` is the only way out.
+            cx.set_quit_mode(QuitMode::Explicit);
+
             let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |_window, cx| cx.new(SwitchApp::new),
-            )
-            .expect("open window");
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        ..Default::default()
+                    },
+                    |_window, cx| cx.new(SwitchApp::new),
+                )
+                .expect("open window");
+
+            // The status item has to be created here: on macOS it needs the main
+            // thread with an event loop already running, which is exactly what
+            // the `run` closure provides.
+            match Tray::install() {
+                Some(tray) => {
+                    let _ = window.update(cx, |app, _window, cx| app.attach_tray(tray, cx));
+                }
+                None => eprintln!("dmux: running without a menu bar item"),
+            }
+
             cx.activate(true);
         });
     }

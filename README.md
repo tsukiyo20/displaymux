@@ -30,8 +30,9 @@ Input Select），把一台显示器在 Mac / Windows / Linux 之间切来切去
 | 显示器被另一台机器占用时仍可读可写 | ✅ 实机验证 |
 | 「把显示器抢回来」的持续重发（`dmux hold`） | ✅ 逻辑跑通，实机双向验证待另一台机器配合 |
 | 亮度调节 | ✅ 实机验证 |
-| GPUI 图形界面 | ✅ 实机验证（截图确认文字、端口列表、当前源高亮均正常） |
-| 托盘常驻 / 全局快捷键 / 开机自启 | ⬜ 未做 |
+| GPUI 图形界面 | ✅ 实机验证（gpui 1.24，截图确认文字、端口列表、当前源高亮） |
+| 菜单栏常驻（托盘） | ✅ 实机验证（截图确认图标、菜单内容、勾选、点击派发） |
+| 全局快捷键 / 开机自启 | ⬜ 未做 |
 | Windows / Linux 后端 | ⬜ 未做（架构已预留，见下） |
 
 唯一实测平台：**macOS 27 / Apple M4**，显示器 R32U81（Mac 接 USB-C，另一台接 DP）。
@@ -64,6 +65,33 @@ cargo build --release --bin dmux --bin dmux-ddc-helper
 cargo build --release --features gui --bin dmux-gui
 ./target/release/dmux-gui
 ```
+
+---
+
+## ⚠️ 屏幕黑了怎么办
+
+**DDC 输入切换是 fire-and-forget 的。** 如果你切到了一个**没有信号**的输入
+（对方机器关机、线没插、或者你切错了口），显示器可能**停在那一路显示"无信号"**，
+而不是自动回切——这时你反而看不到自己的屏幕了。
+
+恢复顺序：
+
+1. **按显示器上的输入源按钮**（或 OSD → Input），选回本机那一路。最快、最可靠。
+2. 显示器的输入项在本文里都用**原始 VCP 值**标注（如 `0x10`），方便和 OSD 对号。
+3. 如果按不到（例如显示器在远处），试电源重插。
+4. 也可以用脚本重发（**前提是 DDC 通道还活着**，见下）：
+
+```bash
+tools/recover-input.sh 0x10 20     # 反复把输入抢回 0x10，每个尝试用新进程
+```
+
+> **为什么脚本可能也没用**：一次 DDC 写入会把该进程的 I2C 通道弄坏
+> （见 [hardware-notes 2.1](docs/hardware-notes.md)），而且当显示器正在显示别的
+> 输入时，读回会失败。所以恢复脚本必须**每 2 秒换一个新进程**重发——这也是它
+> 存在的原因。但**如果通道整体处于坏态，任何软件手段都无效**，只能走 OSD。
+
+**给使用者的建议**：切之前先确认目标输入**确实有信号源开着**。本工具不会替你
+判断这一点——它只知道显示器声明了哪些口。
 
 ---
 
@@ -110,16 +138,45 @@ dmux (CLI)       ─┘        │                        │
 
 ```
 src/
-  lib.rs                     crate 入口，导出下面两个模块
+  lib.rs                     crate 入口：导出下面三个模块
   vcp.rs                     MCCS/VCP：输入源命名、capabilities 解析、别名解析
   ddc.rs                     监督层：进程管理、超时、重试、切换裁决
+  tray.rs                    菜单栏常驻：状态项、菜单、点击派发
   bin/
     dmux.rs                  命令行界面
     dmux-ddc-helper.rs       DDC 操作执行器（serve = 常驻只读模式）
     dmux-gui.rs              GPUI 图形界面
+rust-toolchain.toml          锁定 Rust 1.99.0（gpui 1.24 需要新 std API）
 docs/hardware-notes.md       硬件实测笔记（改 ddc 层前必读）
+docs/gpui-versioning.md      gpui 版本策略与社区调研
 tools/memwatch.sh            测量进程内存峰值/稳态
+tools/mem-baseline.sh        更可信的内存口径（含 PID 身份校验）
+tools/recover-input.sh       切到无信号输入后，把显示器抢回来
 ```
+
+### 菜单栏常驻
+
+`dmux-gui` 会在菜单栏放一个状态项，关掉窗口也继续运行（`QuitMode::Explicit`），
+菜单里可以直接切信号源：
+
+```
+R32U81 - 0x10 DisplayPort 2
+─────────────────────────────
+Refresh
+Reclaim DisplayPort 2
+DisplayPort 1
+✓ DisplayPort 2          ← 当前输入
+HDMI 1
+HDMI 2
+─────────────────────────────
+Show window
+Quit dmux
+```
+
+实现上有两个约束（都写在 [src/tray.rs](src/tray.rs) 里）：macOS 要求状态项在
+**主线程且事件循环已运行**时创建，所以它建在 GPUI 的 `run` 闭包内；`tray-icon`
+的点击走全局回调，因此转发进 channel、由 GPUI 定时器在**主线程**轮询，保证所有
+UI 变更都发生在 GPUI 线程上。
 
 ---
 
@@ -150,18 +207,23 @@ cargo clippy --all-targets
 
 ### 构建 GPUI 的注意事项
 
-有两个 feature 是**必须同时存在**的，少任何一个都会出问题：
+依赖在 **gpui 1.24** 上，用社区分发版 `gpui-unofficial`（按 Zed release tag
+自动同步发布），并**用 `=` 精确锁版本**——gpui 的 minor 号来自 Zed 的 release
+tag，**没有兼容性含义**：
 
 ```toml
-gpui = { version = "0.2.2", default-features = false, features = [
-    "runtime_shaders",  # macOS 没有完整 Xcode 时必需
+gpui = { package = "gpui-unofficial", version = "=1.24.1-pre", default-features = false, optional = true }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.24.1-pre",
+                  default-features = false, features = [
     "font-kit",         # 否则 macOS 上完全没有文字
+    "runtime_shaders",  # macOS 没有完整 Xcode 时必需
 ], optional = true }
 ```
 
-- **`runtime_shaders`**：GPUI 的 `build.rs` 默认会调用 `xcrun -sdk macosx metal`，
-  而该工具只随**完整 Xcode** 提供。用这个 feature 改成运行时编译着色器，只装
-  Command Line Tools 也能构建（代价是首次启动略慢）。装了完整 Xcode 可以去掉。
+三个容易踩的点：
+
+- **两个 feature 都挂在 `gpui_platform` 上，不在 `gpui` 上。** 1.24 起平台后端
+  拆成了独立 crate，这两个 feature 都转发给 `gpui_macos`。
 
 - **`font-kit`**：它在 gpui 的 **default feature 集合**里，所以一旦写
   `default-features = false` 就会被静默关掉，macOS 后端随即回落到
@@ -169,18 +231,25 @@ gpui = { version = "0.2.2", default-features = false, features = [
   这个坑不会以编译错误或运行时报错的形式出现，Zed 官方也踩过
   （[zed#59241](https://github.com/zed-industries/zed/pull/59241)）。
 
+- **入口 API 变了**：`Application::new()` 已不存在，平台实例改为显式传入，
+  所以入口是 `gpui_platform::application().run(..)`。
+
 > **排查口诀**：界面正常但没有文字 → 先跑
 > `cargo tree -e normal | grep -c font-kit`，`0` 就是病因。
 
-完整的实测记录见 [docs/hardware-notes.md](docs/hardware-notes.md#26-default-features--false-会静默关掉整个文字渲染)；
-gpui 版本策略与社区实践见 [docs/gpui-versioning.md](docs/gpui-versioning.md)。
+`rust-toolchain.toml` 锁了 **1.99.0**。这不是跟风：gpui 1.24 用到
+`slice_as_array` 等新 std API，旧工具链会直接编译失败。换 gpui 版本或改用
+fork 之前，请先读 [docs/gpui-versioning.md](docs/gpui-versioning.md)。
+
+完整的实测记录见 [docs/hardware-notes.md](docs/hardware-notes.md#26-default-features--false-会静默关掉整个文字渲染)。
 
 ---
 
 ## 路线图
 
 - [ ] GPUI 界面闭环：端口列表、当前源高亮、切换、抢回
-- [ ] 托盘常驻 + 全局快捷键
+- [x] 菜单栏常驻（托盘 + 菜单，可切源）
+- [ ] 全局快捷键
 - [ ] 「另一台机器关机就自动切回来」的自动策略（轮询 + hold）
 - [ ] Windows 后端
 - [ ] Linux 后端（ddcutil）

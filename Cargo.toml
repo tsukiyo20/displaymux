@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 description = "Lightweight cross-platform tool to switch a monitor's input source (DDC/CI)"
 license = "MIT"
-repository = "https://github.com/ecluna/displaymux"
+repository = "https://github.com/tsukiyo20/displaymux"
 keywords = ["ddc", "ddc-ci", "monitor", "kvm", "gpui"]
 categories = ["hardware-support", "gui"]
 

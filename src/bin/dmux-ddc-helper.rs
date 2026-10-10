@@ -11,11 +11,13 @@
 //! requested, 1 = DDC failure (details still in the JSON).
 //!
 //! HARD RULE derived from measurement on Apple Silicon (M4 + macOS 27):
-//!   * reading VCPs never breaks the DCP I2C channel -- 8/8 fresh-process reads
-//!     and 8/8 same-process reads succeeded, 45-96 ms each;
-//!   * a *write* followed by any further DDC transaction in the SAME process
-//!     wedges the channel (`MacOS kernel I/O error 0x10000003`), and the only
-//!     recovery is a fresh process / fresh IOAVService.
+//!
+//! * reading VCPs never breaks the DCP I2C channel -- 8/8 fresh-process reads
+//!   and 8/8 same-process reads succeeded, 45-96 ms each;
+//! * a *write* followed by any further DDC transaction in the SAME process
+//!   wedges the channel (`MacOS kernel I/O error 0x10000003`), and the only
+//!   recovery is a fresh process / fresh IOAVService.
+//!
 //! Therefore either one operation per process (`dmux-ddc-helper <op>`), or, for
 //! read-only polling, `dmux-ddc-helper serve`, which never writes.
 

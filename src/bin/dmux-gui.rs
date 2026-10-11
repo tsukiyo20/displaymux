@@ -39,6 +39,14 @@
 //!   channel for the rest of that process. Reads are safe to share one
 //!   long-lived process, which is why the reader is persistent.
 
+// Windows: this is a window + tray app, so it must not own a console. Without
+// this the binary is built for the console subsystem and launching it -- from
+// Explorer especially -- opens a black console window next to the UI. The
+// subsystem is only overridden when the GPUI front end is actually compiled in,
+// so the "built without the GPUI front end" stub below still has a console to
+// print its explanation to. (Ignored on non-Windows targets.)
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 #[cfg(not(feature = "gui"))]
 fn main() {
     eprintln!(

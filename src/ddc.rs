@@ -73,6 +73,22 @@ pub fn helper_path() -> Result<PathBuf, DdcError> {
     Err(DdcError::HelperNotFound)
 }
 
+/// Windows: this library is driven by a window/tray app, which owns no console
+/// of its own. Spawning a console program from such a process makes Windows
+/// allocate a *fresh* console window for the child, so every DDC read and write
+/// would flash a black window across the screen. `CREATE_NO_WINDOW` suppresses
+/// that console without touching the pipes the helper actually talks over.
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Elsewhere there is nothing to suppress; the CLI keeps its inherited console.
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
+
 /// Run one DDC operation in a fresh process and parse its JSON result.
 pub fn run(op: &str, args: &[String], timeout: Duration) -> Result<Value, DdcError> {
     let helper = helper_path()?;
@@ -82,6 +98,7 @@ pub fn run(op: &str, args: &[String], timeout: Duration) -> Result<Value, DdcErr
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    no_console_window(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| DdcError::Spawn(e.to_string()))?;
 
@@ -394,13 +411,14 @@ pub struct Reader {
 impl Reader {
     pub fn spawn() -> Result<Reader, DdcError> {
         let helper = helper_path()?;
-        let mut child = Command::new(&helper)
-            .arg("serve")
+        let mut cmd = Command::new(&helper);
+        cmd.arg("serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| DdcError::Spawn(e.to_string()))?;
+            .stderr(Stdio::null());
+        no_console_window(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|e| DdcError::Spawn(e.to_string()))?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stdin = child.stdin.take().expect("stdin piped");

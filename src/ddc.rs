@@ -102,7 +102,9 @@ pub fn run(op: &str, args: &[String], timeout: Duration) -> Result<Value, DdcErr
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(DdcError::Timeout { secs: timeout.as_secs() });
+                    return Err(DdcError::Timeout {
+                        secs: timeout.as_secs(),
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
@@ -116,9 +118,10 @@ pub fn run(op: &str, args: &[String], timeout: Duration) -> Result<Value, DdcErr
         .lines()
         .rev()
         .find(|l| l.trim_start().starts_with('{'))
-        .ok_or_else(|| DdcError::Protocol(format!("no JSON in helper output: {:?}", text.trim())))?;
-    serde_json::from_str(line)
-        .map_err(|e| DdcError::Protocol(format!("{}: {}", e, line.trim())))
+        .ok_or_else(|| {
+            DdcError::Protocol(format!("no JSON in helper output: {:?}", text.trim()))
+        })?;
+    serde_json::from_str(line).map_err(|e| DdcError::Protocol(format!("{}: {}", e, line.trim())))
 }
 
 fn s(v: &Value, key: &str) -> Option<String> {
@@ -227,8 +230,10 @@ impl SwitchOutcome {
     pub fn verdict(&self) -> &'static str {
         match (&self.confirmed_current, self.acknowledged) {
             (Some(cur), _) if *cur == self.wrote => "switched and confirmed",
-            (Some(_), true) => "monitor acknowledged the write but reported a different input \
-                                (likely auto-reverted because that input has no signal)",
+            (Some(_), true) => {
+                "monitor acknowledged the write but reported a different input \
+                                (likely auto-reverted because that input has no signal)"
+            }
             (None, true) => "switch sent (monitor moved off this host, so no readback expected)",
             (_, false) => "failed",
         }
@@ -276,10 +281,7 @@ pub fn set_input_and_confirm(
 pub fn set_brightness(index: usize, value: u16, timeout: Duration) -> Result<Value, DdcError> {
     let v = run(
         "set-brightness",
-        &[
-            format!("--index={}", index),
-            format!("--value={:x}", value),
-        ],
+        &[format!("--index={}", index), format!("--value={:x}", value)],
         timeout,
     )?;
     if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
@@ -346,7 +348,10 @@ pub fn status_retrying_with(
             // input list), but if we can retry, prefer a complete answer.
             Ok(st) if st.current_input.is_some() || attempt == attempts => return Ok(st),
             Ok(st) => {
-                on_retry(attempt, st.read_error.as_deref().unwrap_or("input unreadable"));
+                on_retry(
+                    attempt,
+                    st.read_error.as_deref().unwrap_or("input unreadable"),
+                );
                 last = None;
             }
             Err(e) => {
@@ -415,7 +420,12 @@ impl Reader {
             }
         });
 
-        let reader = Reader { child, stdin, rx, advertised: None };
+        let reader = Reader {
+            child,
+            stdin,
+            rx,
+            advertised: None,
+        };
 
         // Consume the `serve-ready` handshake. It doubles as proof that the
         // helper finished its DDC warm-up, so the very first real request cannot
@@ -424,7 +434,10 @@ impl Reader {
             Ok(line) => {
                 let v: Value = serde_json::from_str(&line)
                     .map_err(|e| DdcError::Protocol(format!("bad handshake: {}: {}", e, line)))?;
-                if v.get("displays").and_then(|d| d.as_array()).map(|a| a.is_empty()) == Some(true)
+                if v.get("displays")
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.is_empty())
+                    == Some(true)
                 {
                     return Err(DdcError::Protocol("no DDC-capable displays found".into()));
                 }
@@ -439,11 +452,15 @@ impl Reader {
     fn request(&mut self, index: usize, caps: bool, timeout: Duration) -> Result<Value, DdcError> {
         let msg = serde_json::json!({ "index": index, "caps": caps });
         writeln!(self.stdin, "{}", msg).map_err(|e| DdcError::Spawn(e.to_string()))?;
-        self.stdin.flush().map_err(|e| DdcError::Spawn(e.to_string()))?;
+        self.stdin
+            .flush()
+            .map_err(|e| DdcError::Spawn(e.to_string()))?;
         match self.rx.recv_timeout(timeout) {
             Ok(line) => serde_json::from_str(&line)
                 .map_err(|e| DdcError::Protocol(format!("{}: {}", e, line))),
-            Err(_) => Err(DdcError::Timeout { secs: timeout.as_secs() }),
+            Err(_) => Err(DdcError::Timeout {
+                secs: timeout.as_secs(),
+            }),
         }
     }
 

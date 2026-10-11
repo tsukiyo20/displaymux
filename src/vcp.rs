@@ -172,7 +172,10 @@ pub fn resolve_input(spec: &str) -> Option<u16> {
         return u16::from_str_radix(rest, 16).ok();
     }
     // Friendly names first, so "17" style decimals can't shadow "hdmi1"
-    let norm: String = lower.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let norm: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     for code in 0x01u16..=0x40 {
         let name: String = input_name(code)
             .to_ascii_lowercase()

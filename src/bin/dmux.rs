@@ -33,21 +33,31 @@ ENVIRONMENT:
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     let p = format!("--{}=", name);
-    args.iter().find_map(|a| a.strip_prefix(&p).map(|s| s.to_string()))
+    args.iter()
+        .find_map(|a| a.strip_prefix(&p).map(|s| s.to_string()))
 }
 
 fn positional(args: &[String]) -> Vec<String> {
-    args.iter().filter(|a| !a.starts_with("--")).cloned().collect()
+    args.iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect()
 }
 
 fn index_of(args: &[String]) -> usize {
-    flag(args, "index").and_then(|v| v.parse().ok()).unwrap_or(0)
+    flag(args, "index")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 fn print_inputs(st: &ddc::Status) {
     for i in &st.inputs {
         let marker = if i.current { "*" } else { " " };
-        let adv = if i.advertised { "" } else { "  (not advertised)" };
+        let adv = if i.advertised {
+            ""
+        } else {
+            "  (not advertised)"
+        };
         println!("  {} {:<8} {:<16}{}", marker, i.code, i.name, adv);
     }
 }
@@ -95,7 +105,13 @@ fn cmd_status(args: &[String]) -> Result<(), DdcError> {
 }
 
 fn cmd_inputs(args: &[String]) -> Result<(), DdcError> {
-    let st = ddc::status_retrying(index_of(args), false, 3, DEFAULT_TIMEOUT, Duration::from_millis(1200))?;
+    let st = ddc::status_retrying(
+        index_of(args),
+        false,
+        3,
+        DEFAULT_TIMEOUT,
+        Duration::from_millis(1200),
+    )?;
     print_inputs(&st);
     Ok(())
 }
@@ -115,8 +131,14 @@ fn cmd_set(args: &[String]) -> Result<(), DdcError> {
     };
     let idx = index_of(args);
     let hex = format!("{:#04x}", code);
-    println!("switching [{}] to {} ({}) ...", idx, hex, vcp::input_name(code));
-    let outcome = ddc::set_input_and_confirm(idx, &hex, DEFAULT_TIMEOUT, Duration::from_millis(2500))?;
+    println!(
+        "switching [{}] to {} ({}) ...",
+        idx,
+        hex,
+        vcp::input_name(code)
+    );
+    let outcome =
+        ddc::set_input_and_confirm(idx, &hex, DEFAULT_TIMEOUT, Duration::from_millis(2500))?;
     println!("result    : {}", outcome.verdict());
     if let Some(cur) = &outcome.confirmed_current {
         println!("readback  : {}", cur);
@@ -170,8 +192,12 @@ fn cmd_hold(args: &[String]) -> Result<(), DdcError> {
         std::process::exit(2);
     };
     let idx = index_of(args);
-    let every = flag(args, "every").and_then(|v| v.parse().ok()).unwrap_or(3u64);
-    let for_secs = flag(args, "for").and_then(|v| v.parse().ok()).unwrap_or(30u64);
+    let every = flag(args, "every")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3u64);
+    let for_secs = flag(args, "for")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30u64);
     let hex = format!("{:#04x}", code);
 
     println!(
@@ -199,7 +225,10 @@ fn cmd_hold(args: &[String]) -> Result<(), DdcError> {
             .map(|c| c.eq_ignore_ascii_case(&hex))
             .unwrap_or(false);
         if already {
-            println!("attempt {:>2}: already on {} -- done after {}s", attempt, hex, elapsed);
+            println!(
+                "attempt {:>2}: already on {} -- done after {}s",
+                attempt, hex, elapsed
+            );
             return Ok(());
         }
         match ddc::set_input(idx, &hex, DEFAULT_TIMEOUT) {
@@ -225,7 +254,12 @@ fn cmd_bright(args: &[String]) -> Result<(), DdcError> {
         std::process::exit(2);
     });
     let v = ddc::set_brightness(index_of(args), value, DEFAULT_TIMEOUT)?;
-    println!("set brightness -> {}", v.get("readback").map(|r| r.to_string()).unwrap_or("?".into()));
+    println!(
+        "set brightness -> {}",
+        v.get("readback")
+            .map(|r| r.to_string())
+            .unwrap_or("?".into())
+    );
     Ok(())
 }
 

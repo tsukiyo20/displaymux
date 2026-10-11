@@ -157,7 +157,10 @@ mod gui {
                 })
                 .expect("spawn ddc worker");
 
-            Worker { tx: req_tx, rx: Arc::new(Mutex::new(res_rx)) }
+            Worker {
+                tx: req_tx,
+                rx: Arc::new(Mutex::new(res_rx)),
+            }
         }
     }
 
@@ -240,7 +243,9 @@ mod gui {
 
         /// Push current state into the menu bar menu.
         fn sync_tray(&mut self) {
-            let Some(tray) = self.tray.as_mut() else { return };
+            let Some(tray) = self.tray.as_mut() else {
+                return;
+            };
             let display = self
                 .status
                 .as_ref()
@@ -287,9 +292,7 @@ mod gui {
         fn poll_tray(&self, cx: &mut Context<Self>) {
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(TRAY_POLL_INTERVAL).await;
-                let event = this.update(cx, |app, _| {
-                    app.tray.as_ref().and_then(|t| t.try_recv())
-                });
+                let event = this.update(cx, |app, _| app.tray.as_ref().and_then(|t| t.try_recv()));
                 match event {
                     Ok(Some(event)) => {
                         if !this
@@ -321,7 +324,10 @@ mod gui {
                 TrayEvent::Switch(code) => {
                     self.pending_input = Some(code.clone());
                     self.send(
-                        Request::Switch { index: self.index, code: code.clone() },
+                        Request::Switch {
+                            index: self.index,
+                            code: code.clone(),
+                        },
                         format!("switching to {}...", code),
                         cx,
                     )
@@ -384,7 +390,8 @@ mod gui {
                         // Deliberately *not* taking the monitor's VCP 0x60 as
                         // "where we are": on the reference monitor it reports a
                         // constant value regardless of the actual input.
-                        let remembered = self.state.last_input(&s.display_id).map(|c| c.to_string());
+                        let remembered =
+                            self.state.last_input(&s.display_id).map(|c| c.to_string());
                         self.current = remembered;
                         self.status = Some(s);
                     }
@@ -401,10 +408,8 @@ mod gui {
                             self.status.as_ref().map(|s| s.display_id.clone()),
                         ) {
                             let mut text = verdict;
-                            if let Some(back) = self
-                                .status
-                                .as_ref()
-                                .and_then(|s| s.current_input.clone())
+                            if let Some(back) =
+                                self.status.as_ref().and_then(|s| s.current_input.clone())
                             {
                                 if !back.eq_ignore_ascii_case(&code) {
                                     // A write that does not move the reported
@@ -450,7 +455,11 @@ mod gui {
         advertised: bool,
         app: gpui::WeakEntity<SwitchApp>,
     ) -> impl IntoElement {
-        let row_bg = if current { rgb(0x2d4f7c) } else { rgb(0x26262e) };
+        let row_bg = if current {
+            rgb(0x2d4f7c)
+        } else {
+            rgb(0x26262e)
+        };
         let code_for_click = code.clone();
         div()
             .id(SharedString::from(format!("input-{}", code)))
@@ -478,15 +487,24 @@ mod gui {
                     }),
             )
             .child(if current {
-                div().text_color(rgb(0xa8a8b0)).child("last sent here").into_any_element()
+                div()
+                    .text_color(rgb(0xa8a8b0))
+                    .child("last sent here")
+                    .into_any_element()
             } else {
-                div().text_color(rgb(0x8ab4f8)).child("switch").into_any_element()
+                div()
+                    .text_color(rgb(0x8ab4f8))
+                    .child("switch")
+                    .into_any_element()
             })
             .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
                 let code = code_for_click.clone();
                 let _ = app.update(cx, |app: &mut SwitchApp, cx| {
                     app.send(
-                        Request::Switch { index: app.index, code: code.clone() },
+                        Request::Switch {
+                            index: app.index,
+                            code: code.clone(),
+                        },
                         format!("switching to {}...", code),
                         cx,
                     );
@@ -530,7 +548,6 @@ mod gui {
                         .collect()
                 })
                 .unwrap_or_default();
-
 
             div()
                 .flex()

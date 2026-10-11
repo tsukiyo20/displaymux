@@ -37,7 +37,12 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { op: "list".into(), index: 0, value: None, caps: false };
+    let mut a = Args {
+        op: "list".into(),
+        index: 0,
+        value: None,
+        caps: false,
+    };
     for arg in std::env::args().skip(1) {
         if let Some(rest) = arg.strip_prefix("--index=") {
             a.index = rest.parse().unwrap_or(0);
@@ -96,7 +101,11 @@ fn serve() {
             }
             Some(d) => match d.handle.get_vcp_feature(VCP_INPUT) {
                 Ok(v) => {
-                    warm = format!("ready after {} warm-up transaction(s) ({:#06x})", attempt, v.value());
+                    warm = format!(
+                        "ready after {} warm-up transaction(s) ({:#06x})",
+                        attempt,
+                        v.value()
+                    );
                     break;
                 }
                 Err(e) => {
@@ -128,7 +137,11 @@ fn serve() {
         let req: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("bad request: {}", e)}));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    json!({"ok": false, "error": format!("bad request: {}", e)})
+                );
                 let _ = out.flush();
                 continue;
             }
@@ -246,7 +259,11 @@ fn main() {
                 .as_deref()
                 .map(|c| vcp::parse_vcp_values(c, VCP_INPUT))
                 .unwrap_or_default();
-            let brightness = display.handle.get_vcp_feature(VCP_BRIGHTNESS).ok().map(|v| v.value());
+            let brightness = display
+                .handle
+                .get_vcp_feature(VCP_BRIGHTNESS)
+                .ok()
+                .map(|v| v.value());
             let out = json!({
                 "ok": true,
                 "op": "status",
@@ -265,7 +282,10 @@ fn main() {
         }
         "set-input" => {
             let Some(value) = args.value else {
-                println!("{}", json!({ "ok": false, "op": "set-input", "error": "--value= required" }));
+                println!(
+                    "{}",
+                    json!({ "ok": false, "op": "set-input", "error": "--value= required" })
+                );
                 std::process::exit(1);
             };
             match display.handle.set_vcp_feature(VCP_INPUT, value) {
@@ -301,13 +321,20 @@ fn main() {
         }
         "set-brightness" => {
             let Some(value) = args.value else {
-                println!("{}", json!({ "ok": false, "op": "set-brightness", "error": "--value= required" }));
+                println!(
+                    "{}",
+                    json!({ "ok": false, "op": "set-brightness", "error": "--value= required" })
+                );
                 std::process::exit(1);
             };
             match display.handle.set_vcp_feature(VCP_BRIGHTNESS, value) {
                 Ok(()) => {
                     std::thread::sleep(Duration::from_millis(120));
-                    let now = display.handle.get_vcp_feature(VCP_BRIGHTNESS).ok().map(|v| v.value());
+                    let now = display
+                        .handle
+                        .get_vcp_feature(VCP_BRIGHTNESS)
+                        .ok()
+                        .map(|v| v.value());
                     println!(
                         "{}",
                         json!({
@@ -328,7 +355,10 @@ fn main() {
             }
         }
         other => {
-            println!("{}", json!({ "ok": false, "error": format!("unknown op: {}", other) }));
+            println!(
+                "{}",
+                json!({ "ok": false, "error": format!("unknown op: {}", other) })
+            );
             std::process::exit(2);
         }
     }

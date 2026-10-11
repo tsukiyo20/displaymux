@@ -69,3 +69,6 @@ gui = ["dep:gpui", "dep:gpui_platform"]
 [profile.release]
 lto = "thin"
 strip = true
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"

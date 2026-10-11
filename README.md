@@ -52,13 +52,15 @@ know:
 |---|---|---|
 | macOS (Apple Silicon) | private `CoreDisplay` / `IOAVService` via [`ddc-macos`](https://github.com/haimgel/ddc-macos-rs) | Works |
 | macOS (Intel) | `IOFramebufferI2CInterface` | Untested |
-| Windows | Monitor Configuration API (`dxva2`) | Compiles, untested on hardware |
+| Windows | Monitor Configuration API (`dxva2`) | Works |
 | Linux | `ddcutil` / `/dev/i2c-*` | Not implemented |
 
 The Windows path needs no platform-specific code: `ddc-hi` already routes to
 `ddc-winapi`, which covers enumeration, `GetVCPFeatureAndVCPFeatureReply`,
-`SetVCPFeature` and `GetCapabilitiesString`. The CLI and helper should build and
-run there as they are.
+`SetVCPFeature` and `GetCapabilitiesString`. The CLI and helper build and run
+there as they are. `build.rs` embeds `assets/icon.ico` into the executables,
+since Windows takes a program's icon from a resource section rather than from a
+file next to it.
 
 > On macOS, DDC is unavailable through the built-in HDMI port on some models. A
 > monitor attached over USB-C or DisplayPort is the reliable case.
@@ -81,6 +83,26 @@ that automatically.
 
 The GUI sits behind the `gui` feature so the CLI stays cheap to build: GPUI brings
 a large dependency tree that the DDC core does not need.
+
+### Installing on macOS
+
+`tools/bundle-macos.sh` builds all three binaries and assembles them into
+`displaymux.app`, with the icon and an ad-hoc signature:
+
+```bash
+tools/bundle-macos.sh              # -> target/release/displaymux.app
+tools/bundle-macos.sh --install    # also copies it to /Applications
+```
+
+All three binaries live in `Contents/MacOS`, which is what lets the GUI find
+`dmux-ddc-helper` beside itself with no configuration. The command line tool is
+then at `/Applications/displaymux.app/Contents/MacOS/dmux`; symlink it somewhere
+on your `PATH` if you want it under the plain name.
+
+The bundle is ad-hoc signed rather than notarised, so it runs locally but macOS
+will warn if it is copied to another machine. Add `LSUIElement` to the
+`Info.plist` the script writes if you would rather it were a pure menu bar app
+with no Dock icon.
 
 ### Regenerating the icon
 

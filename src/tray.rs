@@ -37,50 +37,87 @@ const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
 const ID_HEADER: &str = "header";
 
-/// Build a monochrome monitor glyph as a macOS template image.
+/// The displaymux mark: two inputs converging into one live output.
 ///
-/// macOS tints template images from their alpha channel, so drawing in black
-/// with full alpha is correct and gives a light/dark-adaptive menu bar icon
-/// without shipping any binary asset.
-fn monitor_icon() -> tray_icon::Icon {
-    const S: u32 = 36;
-    let mut rgba = vec![0u8; (S * S * 4) as usize];
-    let mut plot = |x: u32, y: u32| {
-        if x < S && y < S {
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = 0;
-            rgba[i + 1] = 0;
-            rgba[i + 2] = 0;
-            rgba[i + 3] = 255;
-        }
+/// The geometry is the one `tools/make-icon.py` emits, expressed in that
+/// script's 1024pt app-icon space and scaled down here -- so the menu bar, the
+/// app icon and the README all show literally the same mark.
+///
+/// A macOS template image is tinted from its alpha channel alone, so the
+/// live/dormant distinction that colour carries in the app icon becomes
+/// opacity: the dormant branch is drawn at `DORMANT_ALPHA` and AppKit renders
+/// it correspondingly lighter.
+///
+/// Strokes are rasterised from a signed distance field rather than plotted
+/// pixel by pixel, which is what keeps the diagonals and the round caps smooth
+/// without shipping a binary asset.
+fn mux_icon() -> tray_icon::Icon {
+    /// `tray-icon` sizes this bitmap into a 22pt-tall `NSImage` (its
+    /// `MAX_ICON_HEIGHT`). Supplying fewer pixels than 22pt needs on a Retina
+    /// display resamples twice and looks soft, so render at 4x.
+    const BITMAP_PX: u32 = 88;
+    const NSIMAGE_PT: f32 = 22.0;
+    /// How tall the mark should read inside the menu bar.
+    const MARK_PT: f32 = 16.0;
+    const DORMANT_ALPHA: f32 = 0.45;
+
+    /// Glyph vertices in app-icon space, mirroring `tools/make-icon.py`.
+    /// Live branch: full length, ending in the stem that leaves for the display.
+    const LIVE: [(f32, f32); 4] = [(-150.0, -330.0), (-150.0, -96.0), (0.0, 80.0), (0.0, 330.0)];
+    /// Dormant branch: a shorter stub, which is what stops the mark reading as "Y".
+    const DORMANT: [(f32, f32); 3] = [(150.0, -250.0), (150.0, -96.0), (0.0, 80.0)];
+    const STROKE: f32 = 92.0;
+    /// Top-to-bottom extent of the finished mark, stroke included.
+    const EXTENT: f32 = 752.0;
+
+    let scale = (MARK_PT / NSIMAGE_PT) * BITMAP_PX as f32 / EXTENT;
+    let half = STROKE * scale / 2.0;
+    let centre = BITMAP_PX as f32 / 2.0;
+    let place = |points: &[(f32, f32)]| -> Vec<(f32, f32)> {
+        points
+            .iter()
+            .map(|&(x, y)| (x * scale, y * scale))
+            .collect()
     };
-    // screen: 3px border, with a gap so it reads as a monitor rather than a box
-    let (x0, y0, x1, y1) = (5u32, 8u32, S - 5, 24u32);
-    for x in x0..x1 {
-        for t in 0..3 {
-            plot(x, y0 + t);
-            plot(x, y1 - 1 - t);
+    let live = place(&LIVE);
+    let dormant = place(&DORMANT);
+
+    fn distance_to_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let (ax, ay) = a;
+        let (vx, vy) = (b.0 - ax, b.1 - ay);
+        let len2 = vx * vx + vy * vy;
+        let t = if len2 > 0.0 {
+            (((px - ax) * vx + (py - ay) * vy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (dx, dy) = (px - (ax + t * vx), py - (ay + t * vy));
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Fraction of the pixel covered by a round-capped polyline.
+    fn coverage(px: f32, py: f32, points: &[(f32, f32)], half: f32) -> f32 {
+        let mut nearest = f32::MAX;
+        for pair in points.windows(2) {
+            nearest = nearest.min(distance_to_segment(px, py, pair[0], pair[1]));
+        }
+        (half + 0.5 - nearest).clamp(0.0, 1.0)
+    }
+
+    let mut rgba = vec![0u8; (BITMAP_PX * BITMAP_PX * 4) as usize];
+    for y in 0..BITMAP_PX {
+        for x in 0..BITMAP_PX {
+            let px = x as f32 + 0.5 - centre;
+            let py = y as f32 + 0.5 - centre;
+            let dormant = coverage(px, py, &dormant, half) * DORMANT_ALPHA;
+            let live = coverage(px, py, &live, half);
+            // Source-over: the live branch wins where the two overlap.
+            let alpha = live + dormant * (1.0 - live);
+            let i = ((y * BITMAP_PX + x) * 4) as usize;
+            rgba[i + 3] = (alpha * 255.0).round() as u8;
         }
     }
-    for y in y0..y1 {
-        for t in 0..3 {
-            plot(x0 + t, y);
-            plot(x1 - 1 - t, y);
-        }
-    }
-    // stand
-    for y in y1..y1 + 4 {
-        for x in S / 2 - 2..S / 2 + 2 {
-            plot(x, y);
-        }
-    }
-    // base
-    for x in S / 2 - 7..S / 2 + 7 {
-        for y in y1 + 4..y1 + 7 {
-            plot(x, y);
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, S, S).expect("icon buffer is well formed")
+    tray_icon::Icon::from_rgba(rgba, BITMAP_PX, BITMAP_PX).expect("icon buffer is well formed")
 }
 
 /// The live menu bar item plus the rows that get rewritten on refresh.
@@ -122,9 +159,9 @@ impl Tray {
         // macOS wants a template image so AppKit can tint it to match the menu
         // bar; other platforms take the pixels as they are.
         #[cfg(target_os = "macos")]
-        let builder = TrayIconBuilder::new().with_icon_templated(monitor_icon());
+        let builder = TrayIconBuilder::new().with_icon_templated(mux_icon());
         #[cfg(not(target_os = "macos"))]
-        let builder = TrayIconBuilder::new().with_icon(monitor_icon());
+        let builder = TrayIconBuilder::new().with_icon(mux_icon());
 
         let icon = match builder
             .with_tooltip("dmux - monitor input switcher")
@@ -168,10 +205,12 @@ impl Tray {
             // claims: on the reference monitor VCP 0x60 does not follow the
             // actual input, and a wrong "you are here" is worse than none.
             Some((code, name)) => {
-                self.header.set_text(format!("{display} - last sent: {code} {name}"));
+                self.header
+                    .set_text(format!("{display} - last sent: {code} {name}"));
             }
             None => {
-                self.header.set_text(format!("{display} - no input sent yet"));
+                self.header
+                    .set_text(format!("{display} - no input sent yet"));
             }
         }
         self.show.set_text("Show window");
@@ -219,21 +258,23 @@ impl Tray {
 /// `tray-icon`'s callback is global and set-once, so this bridges it into a
 /// plain channel rather than exposing the crate's types to the UI layer.
 fn forward_events(tx: Sender<TrayEvent>) {
-    tray_icon::menu::MenuEvent::set_event_handler(Some(move |event: tray_icon::menu::MenuEvent| {
-        let id = event.id.0.as_str();
-        let translated = if let Some(code) = id.strip_prefix(ID_SWITCH_PREFIX) {
-            Some(TrayEvent::Switch(code.to_string()))
-        } else {
-            match id {
-                ID_REFRESH => Some(TrayEvent::Refresh),
-                ID_SHOW => Some(TrayEvent::Show),
-                ID_QUIT => Some(TrayEvent::Quit),
-                _ => None,
+    tray_icon::menu::MenuEvent::set_event_handler(Some(
+        move |event: tray_icon::menu::MenuEvent| {
+            let id = event.id.0.as_str();
+            let translated = if let Some(code) = id.strip_prefix(ID_SWITCH_PREFIX) {
+                Some(TrayEvent::Switch(code.to_string()))
+            } else {
+                match id {
+                    ID_REFRESH => Some(TrayEvent::Refresh),
+                    ID_SHOW => Some(TrayEvent::Show),
+                    ID_QUIT => Some(TrayEvent::Quit),
+                    _ => None,
+                }
+            };
+            if let Some(ev) = translated {
+                // A dead receiver just means the app is shutting down.
+                let _ = tx.send(ev);
             }
-        };
-        if let Some(ev) = translated {
-            // A dead receiver just means the app is shutting down.
-            let _ = tx.send(ev);
-        }
-    }));
+        },
+    ));
 }

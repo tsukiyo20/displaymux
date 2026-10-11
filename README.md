@@ -1,3 +1,5 @@
+<img src="assets/icon-256.png" width="128" height="128" alt="displaymux icon: two inputs converging into one live output">
+
 # displaymux
 
 Switch a monitor's input source from the command line or the menu bar, over
@@ -79,6 +81,21 @@ that automatically.
 
 The GUI sits behind the `gui` feature so the CLI stays cheap to build: GPUI brings
 a large dependency tree that the DDC core does not need.
+
+### Regenerating the icon
+
+`assets/` is generated, not hand-drawn. `tools/make-icon.py` holds the geometry
+and emits the SVG master, every PNG size, `icon.icns` and `icon.ico`:
+
+```bash
+python3 tools/make-icon.py
+```
+
+It needs one SVG rasteriser (`resvg`, `rsvg-convert` or `cairosvg`); `iconutil`
+(macOS) and Pillow are used for the `.icns` and `.ico` when available. The menu
+bar icon is not an asset — `src/tray.rs` rasterises the same geometry from a
+signed distance field at runtime, so the menu bar, the app icon and this README
+all show the same mark.
 
 ### A note on the GPUI dependency
 

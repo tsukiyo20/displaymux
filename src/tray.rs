@@ -17,7 +17,7 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// A click on one of our menu rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,16 @@ const ID_REFRESH: &str = "refresh";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
 const ID_HEADER: &str = "header";
+
+/// Whether a left click opens the menu, or does the obvious thing instead.
+///
+/// macOS opens a status item's menu on any click, so it stays on there. Windows
+/// anchors a pop-up menu by its **bottom** edge at the pointer, which puts the
+/// menu's last row under the pointer the moment it opens -- and the last row
+/// here is "Quit dmux", so a double click on the icon quits the app outright.
+/// Elsewhere a left click therefore brings the window back, and the menu is
+/// reached deliberately, with the right button.
+const MENU_ON_LEFT_CLICK: bool = cfg!(target_os = "macos");
 
 /// The displaymux mark: two inputs converging into one live output.
 ///
@@ -166,6 +176,7 @@ impl Tray {
         let icon = match builder
             .with_tooltip("dmux - monitor input switcher")
             .with_menu(Box::new(menu.clone()))
+            .with_menu_on_left_click(MENU_ON_LEFT_CLICK)
             .build()
         {
             Ok(icon) => icon,
@@ -253,11 +264,12 @@ impl Tray {
     }
 }
 
-/// Install the global menu handler and hand events to `tx`.
+/// Install the global menu and icon handlers and hand events to `tx`.
 ///
-/// `tray-icon`'s callback is global and set-once, so this bridges it into a
+/// `tray-icon`'s callbacks are global and set-once, so this bridges them into a
 /// plain channel rather than exposing the crate's types to the UI layer.
 fn forward_events(tx: Sender<TrayEvent>) {
+    let clicks = tx.clone();
     tray_icon::menu::MenuEvent::set_event_handler(Some(
         move |event: tray_icon::menu::MenuEvent| {
             let id = event.id.0.as_str();
@@ -277,4 +289,21 @@ fn forward_events(tx: Sender<TrayEvent>) {
             }
         },
     ));
+
+    // A left click stands in for "Show window" only where it does not open the
+    // menu; on macOS the click itself is what opens it.
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if !MENU_ON_LEFT_CLICK {
+            // A dead receiver just means the app is shutting down.
+            let _ = clicks.send(TrayEvent::Show);
+        }
+    }));
 }

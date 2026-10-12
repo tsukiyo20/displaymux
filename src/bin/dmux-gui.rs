@@ -69,8 +69,8 @@ mod gui {
     use displaymux::state::State;
     use displaymux::tray::{Tray, TrayEvent};
     use gpui::{
-        div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, IntoElement, QuitMode,
-        SharedString, Window, WindowBounds, WindowOptions,
+        div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Global, IntoElement,
+        QuitMode, SharedString, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
     };
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -178,9 +178,6 @@ mod gui {
         message: SharedString,
         busy: bool,
         index: usize,
-        /// `None` when the status item could not be created; the window then
-        /// remains the only interface.
-        tray: Option<Tray>,
         /// Persisted "where is this host plugged in" knowledge. Authoritative
         /// over the monitor's readback, which is unreliable on some monitors
         /// (see `displaymux::state`).
@@ -205,7 +202,6 @@ mod gui {
                 message: "reading monitor state...".into(),
                 busy: true,
                 index: 0,
-                tray: None,
                 state: State::load(),
                 current: None,
                 session: session::current(),
@@ -234,7 +230,7 @@ mod gui {
                     .unwrap_or(false);
                 if changed {
                     let _ = this.update(cx, |app, cx| {
-                        app.sync_tray();
+                        app.sync_tray(cx);
                         cx.notify();
                     });
                 }
@@ -242,16 +238,14 @@ mod gui {
             .detach();
         }
 
-        /// Attach the menu bar item and start listening to it.
-        fn attach_tray(&mut self, tray: Tray, cx: &mut Context<Self>) {
-            self.tray = Some(tray);
-            self.sync_tray();
-            self.poll_tray(cx);
-        }
-
         /// Push current state into the menu bar menu.
-        fn sync_tray(&mut self) {
-            let Some(tray) = self.tray.as_mut() else {
+        ///
+        /// The tray itself lives in [`Installed`], not in this view: it has to
+        /// outlive the window, which `QuitMode::Explicit` keeps the app running
+        /// past, and a tray that dies with the window leaves an icon whose menu
+        /// does nothing at all -- not even quit.
+        fn sync_tray(&mut self, cx: &mut Context<Self>) {
+            let Some(tray) = cx.global_mut::<Installed>().tray.as_mut() else {
                 return;
             };
             let display = self
@@ -296,38 +290,13 @@ mod gui {
             );
         }
 
-        /// Poll tray clicks on a timer, on the GPUI thread.
-        fn poll_tray(&self, cx: &mut Context<Self>) {
-            cx.spawn(async move |this, cx| loop {
-                cx.background_executor().timer(TRAY_POLL_INTERVAL).await;
-                let event = this.update(cx, |app, _| app.tray.as_ref().and_then(|t| t.try_recv()));
-                match event {
-                    Ok(Some(event)) => {
-                        if !this
-                            .update(cx, |app, cx| app.handle_tray(event, cx))
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(_) => break,
-                }
-            })
-            .detach();
-        }
-
-        /// Returns `false` when the app should stop polling (quit).
-        fn handle_tray(&mut self, event: TrayEvent, cx: &mut Context<Self>) -> bool {
+        /// Act on the tray clicks that need this view.
+        ///
+        /// `Show` and `Quit` never reach here: they are handled where the tray
+        /// lives, outside this view's borrow, because raising the window means
+        /// borrowing the view again.
+        fn on_tray(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
             match event {
-                TrayEvent::Quit => {
-                    cx.quit();
-                    return false;
-                }
-                TrayEvent::Show => {
-                    cx.activate(true);
-                    return true;
-                }
                 TrayEvent::Refresh => self.send(Request::Refresh, "reading monitor state...", cx),
                 TrayEvent::Switch(code) => {
                     self.pending_input = Some(code.clone());
@@ -340,8 +309,8 @@ mod gui {
                         cx,
                     )
                 }
+                TrayEvent::Show | TrayEvent::Quit => {}
             }
-            true
         }
 
         /// Poll the worker's response channel on a timer, so the UI thread never
@@ -355,7 +324,7 @@ mod gui {
                     match got {
                         Some(Ok(resp)) => {
                             let _ = this.update(cx, |app, cx| {
-                                app.apply(resp);
+                                app.apply(resp, cx);
                                 cx.notify();
                             });
                             break;
@@ -377,7 +346,7 @@ mod gui {
             .detach();
         }
 
-        fn apply(&mut self, resp: Response) {
+        fn apply(&mut self, resp: Response, cx: &mut Context<Self>) {
             self.busy = false;
             match resp {
                 Response::Status(st) => match *st {
@@ -441,7 +410,7 @@ mod gui {
                     Err(e) => self.message = format!("switch failed: {}", e).into(),
                 },
             }
-            self.sync_tray();
+            self.sync_tray(cx);
         }
 
         fn send(&mut self, req: Request, note: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -627,6 +596,109 @@ mod gui {
         }
     }
 
+    /// The tray, and the view it forwards to, held at app level.
+    ///
+    /// The tray used to live in `SwitchApp`, which put the poll loop on the
+    /// window's view. Closing the window dropped that entity, and with it the
+    /// loop: the icon stayed in the tray but its menu went dead, and
+    /// `QuitMode::Explicit` leaves "Quit dmux" as the only way out. Holding it
+    /// here also lets a left click raise the window from outside the view's
+    /// borrow, which is what `WindowHandle::update` requires.
+    struct Installed {
+        /// `None` when the status item could not be created; the window then
+        /// remains the only interface.
+        tray: Option<Tray>,
+        /// The live view, while there is a window. `None` once the window has
+        /// been closed, which the tray now survives.
+        app: Option<WeakEntity<SwitchApp>>,
+    }
+
+    impl Global for Installed {}
+
+    /// Poll the tray for the life of the app, outside any view's borrow.
+    ///
+    /// `tray-icon` delivers clicks through global callbacks on threads we do not
+    /// own, so they are forwarded into a channel and drained here, on the GPUI
+    /// thread.
+    fn poll_tray(cx: &mut App) {
+        cx.spawn(async move |cx| loop {
+            cx.background_executor().timer(TRAY_POLL_INTERVAL).await;
+            let event = cx.update(|cx| {
+                cx.global_mut::<Installed>()
+                    .tray
+                    .as_mut()
+                    .and_then(|tray| tray.try_recv())
+            });
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                TrayEvent::Quit => {
+                    cx.update(|cx| cx.quit());
+                    break;
+                }
+                TrayEvent::Show => cx.update(raise_main_window),
+                // The rest is about the display, so it needs a view to act on.
+                TrayEvent::Refresh => cx.update(|cx| forward_to_view(cx, TrayEvent::Refresh)),
+                TrayEvent::Switch(code) => {
+                    cx.update(|cx| forward_to_view(cx, TrayEvent::Switch(code)))
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Hand a click to the view, if a window is still open.
+    fn forward_to_view(cx: &mut App, event: TrayEvent) {
+        let app = cx.global::<Installed>().app.clone();
+        if let Some(app) = app {
+            let _ = app.update(cx, |app, cx| app.on_tray(event, cx));
+        }
+    }
+
+    /// Open the main window and register its view with the tray.
+    fn open_main_window(cx: &mut App) -> Option<WindowHandle<SwitchApp>> {
+        let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
+        let handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(SwitchApp::new),
+            )
+            .ok()?;
+        // Give the tray the view it forwards to.
+        if let Ok(app) = handle.update(cx, |_, _, cx| cx.entity().downgrade()) {
+            cx.global_mut::<Installed>().app = Some(app);
+        }
+        Some(handle)
+    }
+
+    /// Bring the window back, restoring it if it is minimized, or build it again
+    /// if it was closed.
+    ///
+    /// `App::activate` is what gpui offers for this, and the Windows backend
+    /// implements it as an empty function, so the platform window is asked
+    /// directly instead.
+    fn raise_main_window(cx: &mut App) {
+        let handle = cx
+            .windows()
+            .into_iter()
+            .find_map(|any| any.downcast::<SwitchApp>());
+        match handle {
+            Some(handle) => {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
+            // Closing the window does not quit (`QuitMode::Explicit`), so the
+            // tray has to be able to bring it back rather than leave "Show
+            // window" and a left click doing nothing at all.
+            None => {
+                open_main_window(cx);
+            }
+        }
+    }
+
     pub fn run() {
         // Modern entry point: the platform backends live in `gpui_platform`, and
         // the platform instance is now passed in explicitly rather than created
@@ -636,26 +708,20 @@ mod gui {
             // a request to exit. `TrayEvent::Quit` is the only way out.
             cx.set_quit_mode(QuitMode::Explicit);
 
-            let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        ..Default::default()
-                    },
-                    |_window, cx| cx.new(SwitchApp::new),
-                )
-                .expect("open window");
-
             // The status item has to be created here: on macOS it needs the main
             // thread with an event loop already running, which is exactly what
-            // the `run` closure provides.
-            match Tray::install() {
-                Some(tray) => {
-                    let _ = window.update(cx, |app, _window, cx| app.attach_tray(tray, cx));
-                }
-                None => eprintln!("dmux: running without a menu bar item"),
+            // the `run` closure provides. It goes in before the window so that
+            // the view always finds it.
+            let tray = Tray::install();
+            let installed = tray.is_some();
+            cx.set_global(Installed { tray, app: None });
+            if installed {
+                poll_tray(cx);
+            } else {
+                eprintln!("dmux: running without a menu bar item");
             }
+
+            open_main_window(cx).expect("open window");
 
             cx.activate(true);
         });

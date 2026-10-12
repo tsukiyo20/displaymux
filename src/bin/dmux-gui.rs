@@ -678,10 +678,17 @@ mod gui {
     /// Bring the window back, restoring it if it is minimized, or build it again
     /// if it was closed.
     ///
-    /// `App::activate` is what gpui offers for this, and the Windows backend
-    /// implements it as an empty function, so the platform window is asked
-    /// directly instead.
+    /// Two calls, because they do different jobs and each platform implements
+    /// only one of them:
+    ///
+    /// * `App::activate` raises the *application*. Without it macOS leaves the
+    ///   window behind whatever was already in front, because activating a
+    ///   window only reorders windows inside its own app. The Windows backend
+    ///   implements this as an empty function.
+    /// * `Window::activate_window` raises the window itself, which is what
+    ///   actually does the work on Windows.
     fn raise_main_window(cx: &mut App) {
+        cx.activate(true);
         let handle = cx
             .windows()
             .into_iter()

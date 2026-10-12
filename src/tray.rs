@@ -14,7 +14,7 @@
 //! (`QuitMode::Explicit`): the menu bar item is the primary interface once the
 //! window is gone.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use async_channel::Sender;
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -139,14 +139,16 @@ pub struct Tray {
     /// Input rows, rebuilt whenever the advertised list changes.
     rows: Vec<(String, CheckMenuItem)>,
     menu: Menu,
-    events: Receiver<TrayEvent>,
 }
 
 impl Tray {
     /// Create the status item and its menu. Must run on the main thread.
-    pub fn install() -> Option<Tray> {
-        let (tx, rx) = channel::<TrayEvent>();
-        forward_events(tx);
+    ///
+    /// Clicks are delivered on `events`, which the caller keeps: `tray-icon`
+    /// hands them over on threads we do not own, and awaiting the channel is
+    /// how the UI thread picks them up without polling for them.
+    pub fn install(events: Sender<TrayEvent>) -> Option<Tray> {
+        forward_events(events);
 
         let header = MenuItem::with_id(ID_HEADER, "dmux: reading monitor...", false, None);
         let refresh = MenuItem::with_id(ID_REFRESH, "Refresh", true, None);
@@ -192,13 +194,7 @@ impl Tray {
             show,
             rows: Vec::new(),
             menu,
-            events: rx,
         })
-    }
-
-    /// Non-blocking poll, called from a GPUI timer on the main thread.
-    pub fn try_recv(&self) -> Option<TrayEvent> {
-        self.events.try_recv().ok()
     }
 
     /// Rewrite the menu to match the current monitor state.
@@ -267,7 +263,9 @@ impl Tray {
 /// Install the global menu and icon handlers and hand events to `tx`.
 ///
 /// `tray-icon`'s callbacks are global and set-once, so this bridges them into a
-/// plain channel rather than exposing the crate's types to the UI layer.
+/// plain channel rather than exposing the crate's types to the UI layer. They
+/// fire on threads we do not own, which is why `try_send` is all that is needed
+/// here: the channel is unbounded, so it only ever fails once the app is gone.
 fn forward_events(tx: Sender<TrayEvent>) {
     let clicks = tx.clone();
     tray_icon::menu::MenuEvent::set_event_handler(Some(
@@ -285,7 +283,7 @@ fn forward_events(tx: Sender<TrayEvent>) {
             };
             if let Some(ev) = translated {
                 // A dead receiver just means the app is shutting down.
-                let _ = tx.send(ev);
+                let _ = tx.try_send(ev);
             }
         },
     ));
@@ -303,7 +301,7 @@ fn forward_events(tx: Sender<TrayEvent>) {
         };
         if !MENU_ON_LEFT_CLICK {
             // A dead receiver just means the app is shutting down.
-            let _ = clicks.send(TrayEvent::Show);
+            let _ = clicks.try_send(TrayEvent::Show);
         }
     }));
 }

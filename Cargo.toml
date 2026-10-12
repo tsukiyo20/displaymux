@@ -59,6 +59,10 @@ gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.24.1-
 # Not optional: the tray lives in the library (src/tray.rs), not in the GUI
 # binary, so the CLI build links it too. It is small and pulls no GUI stack.
 tray-icon = "0.26"
+# How `tray.rs` hands status-item clicks to the UI thread. Awaiting it beats
+# polling on a timer. Not optional, for the same reason `tray-icon` is not:
+# the tray lives in the library, so the CLI build needs it too.
+async-channel = "2.5"
 
 [features]
 default = []

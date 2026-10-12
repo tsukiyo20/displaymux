@@ -33,6 +33,8 @@ struct Args {
     op: String,
     index: usize,
     value: Option<u16>,
+    /// VCP codes to read, for the `vcp` diagnostic op.
+    codes: Vec<u8>,
     caps: bool,
 }
 
@@ -41,6 +43,7 @@ fn parse_args() -> Args {
         op: "list".into(),
         index: 0,
         value: None,
+        codes: Vec::new(),
         caps: false,
     };
     for arg in std::env::args().skip(1) {
@@ -48,6 +51,11 @@ fn parse_args() -> Args {
             a.index = rest.parse().unwrap_or(0);
         } else if let Some(rest) = arg.strip_prefix("--value=") {
             a.value = u16::from_str_radix(rest.trim_start_matches("0x"), 16).ok();
+        } else if let Some(rest) = arg.strip_prefix("--vcp=") {
+            a.codes = rest
+                .split(',')
+                .filter_map(|c| u8::from_str_radix(c.trim().trim_start_matches("0x"), 16).ok())
+                .collect();
         } else if arg == "--caps" {
             a.caps = true;
         } else {
@@ -279,6 +287,43 @@ fn main() {
                 "elapsed_ms": started.elapsed().as_millis() as u64,
             });
             println!("{}", out);
+        }
+        // Read arbitrary VCP codes. Not every monitor answers every code, and
+        // the capability list is the only guide to what it will answer, so a
+        // failure is reported per code rather than failing the whole read.
+        "vcp" => {
+            if args.codes.is_empty() {
+                println!(
+                    "{}",
+                    json!({ "ok": false, "op": "vcp", "error": "--vcp=0xNN[,0xNN...] required" })
+                );
+                std::process::exit(1);
+            }
+            let reads: Vec<_> = args
+                .codes
+                .iter()
+                .map(|code| {
+                    let (value, err) = match display.handle.get_vcp_feature(*code) {
+                        Ok(v) => (Some(v.value()), None),
+                        Err(e) => (None, Some(e.to_string())),
+                    };
+                    json!({
+                        "code": hexstr(*code as u16),
+                        "value": value.map(hexstr),
+                        "error": err,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "op": "vcp",
+                    "display": { "index": args.index, "id": id },
+                    "reads": reads,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                })
+            );
         }
         "set-input" => {
             let Some(value) = args.value else {

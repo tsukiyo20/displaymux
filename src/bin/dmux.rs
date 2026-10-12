@@ -24,6 +24,16 @@ USAGE:
                                             selected -- the tug-of-war that lets a Mac
                                             reclaim the monitor from the other machine
     dmux bright <0-100> [--index=N]        set brightness
+    dmux vcp <code> [<code>...] [--index=N]
+                                            read arbitrary VCP codes, e.g.
+                                            `dmux vcp 0x60 0xae`. Useful for
+                                            checking what a monitor actually
+                                            answers: 0xae is the vertical
+                                            frequency of the signal it is
+                                            displaying right now, which tells
+                                            you which input it is showing when
+                                            the two machines differ in refresh
+                                            rate.
 
 ENVIRONMENT:
     DMUX_DDC_HELPER   path to dmux-ddc-helper
@@ -101,6 +111,44 @@ fn cmd_status(args: &[String]) -> Result<(), DdcError> {
         println!("caps raw  : {}", c.trim());
     }
     println!("latency   : {} ms", st.elapsed_ms);
+    Ok(())
+}
+
+fn cmd_vcp(args: &[String]) -> Result<(), DdcError> {
+    let index = index_of(args);
+    let codes: Vec<u8> = args
+        .iter()
+        .filter(|a| !a.starts_with("--") && !a.starts_with('-'))
+        .filter_map(|a| u8::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+        .collect();
+    if codes.is_empty() {
+        eprintln!("usage: dmux vcp <code> [<code>...] [--index=N]   (codes in hex)");
+        std::process::exit(2);
+    }
+    let reads = ddc::read_vcps(index, &codes, DEFAULT_TIMEOUT)?;
+    for r in &reads {
+        match r.value {
+            Some(v) => {
+                // Only 0x60's values are input identifiers; naming the values
+                // of any other code off that table would be a fabrication.
+                let note = match r.code {
+                    0x60 => format!("  ({})", vcp::input_name(v)),
+                    // MCCS gives 0xae vertical frequency in hundredths of a
+                    // hertz, which is what makes it usable as "what is on
+                    // screen right now".
+                    0xae => format!("  ({:.2} Hz)", v as f64 / 100.0),
+                    0xac => format!("  ({} Hz)", v),
+                    _ => String::new(),
+                };
+                println!("0x{:02x}  = 0x{:04x}{}", r.code, v, note);
+            }
+            None => println!(
+                "0x{:02x}  = --      [{}]",
+                r.code,
+                r.error.as_deref().unwrap_or("no answer")
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -289,6 +337,7 @@ fn main() {
         "toggle" => cmd_toggle(rest),
         "hold" => cmd_hold(rest),
         "bright" | "brightness" => cmd_bright(rest),
+        "vcp" => cmd_vcp(rest),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())

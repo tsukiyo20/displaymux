@@ -227,6 +227,54 @@ pub fn status(index: usize, caps: bool, timeout: Duration) -> Result<Status, Ddc
     Ok(Status::from_json(&v))
 }
 
+/// One VCP code read back from the monitor.
+#[derive(Debug, Clone)]
+pub struct VcpRead {
+    pub code: u8,
+    /// `None` when the monitor would not answer this code.
+    pub value: Option<u16>,
+    pub error: Option<String>,
+}
+
+/// Read arbitrary VCP codes in one trip through the helper.
+///
+/// The capability string is the only guide to what a monitor will answer, and
+/// even listed codes get refused, so each code carries its own result rather
+/// than failing the whole read.
+pub fn read_vcps(index: usize, codes: &[u8], timeout: Duration) -> Result<Vec<VcpRead>, DdcError> {
+    let list = codes
+        .iter()
+        .map(|c| format!("0x{:02x}", c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let args = vec![format!("--index={}", index), format!("--vcp={}", list)];
+    let v = run("vcp", &args, timeout)?;
+    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+        return Err(DdcError::Protocol(
+            s(&v, "error").unwrap_or_else(|| "helper reported failure".into()),
+        ));
+    }
+    let reads = v
+        .get("reads")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let code =
+                        u8::from_str_radix(s(r, "code")?.trim_start_matches("0x"), 16).ok()?;
+                    Some(VcpRead {
+                        code,
+                        value: s(r, "value")
+                            .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok()),
+                        error: s(r, "error"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(reads)
+}
+
 /// Outcome of asking a monitor to change input.
 #[derive(Debug, Clone)]
 pub struct SwitchOutcome {

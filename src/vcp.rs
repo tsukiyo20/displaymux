@@ -109,9 +109,40 @@ pub fn candidate_inputs(advertised: &[u16], current: Option<u16>) -> Vec<u16> {
     v
 }
 
+/// Trim the duplicated bytes some monitors put in a VCP 0x60 reply.
+///
+/// Dell is the commonly cited offender: after selecting `0x0f` the monitor
+/// answers `0x0f0f`, and after `0x11` it answers `0x1111`. Taken at face value
+/// that matches no entry in the capability list, which would leave every port
+/// looking unrecognised and the current input unknown.
+///
+/// Applied to the input source only. For codes whose value is genuinely 16-bit
+/// -- the frequency codes `0xac` and `0xae` among them -- two equal bytes are a
+/// legitimate reading, and halving them would corrupt it.
+pub fn normalize_input_value(value: u16) -> u16 {
+    let (high, low) = (value >> 8, value & 0xff);
+    if high == low {
+        low
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trims_duplicated_input_bytes() {
+        // Dell-style replies
+        assert_eq!(normalize_input_value(0x0f0f), 0x0f);
+        assert_eq!(normalize_input_value(0x1111), 0x11);
+        // ordinary replies are untouched
+        assert_eq!(normalize_input_value(0x0f), 0x0f);
+        assert_eq!(normalize_input_value(0x0010), 0x10);
+        // a genuine 16-bit reading must survive
+        assert_eq!(normalize_input_value(0x3e11), 0x3e11);
+    }
 
     #[test]
     fn parses_real_caps_string() {

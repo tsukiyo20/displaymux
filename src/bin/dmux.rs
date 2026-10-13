@@ -132,6 +132,13 @@ fn cmd_vcp(args: &[String]) -> Result<(), DdcError> {
                 // Only 0x60's values are input identifiers; naming the values
                 // of any other code off that table would be a fabrication.
                 let note = match r.code {
+                    // The raw reply is shown as read. When a monitor duplicates
+                    // the byte, that is worth seeing rather than silently
+                    // correcting, because it explains a wrong-looking value.
+                    0x60 if vcp::normalize_input_value(v) != v => format!(
+                        "  ({}; the byte is duplicated, as some monitors do)",
+                        vcp::input_name(vcp::normalize_input_value(v))
+                    ),
                     0x60 => format!("  ({})", vcp::input_name(v)),
                     // MCCS gives 0xae vertical frequency in hundredths of a
                     // hertz, which is what makes it usable as "what is on

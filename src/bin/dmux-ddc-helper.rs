@@ -160,7 +160,9 @@ fn serve() {
             None => json!({"ok": false, "error": format!("display index {} out of range", index)}),
             Some(d) => {
                 let (current, read_err) = match d.handle.get_vcp_feature(VCP_INPUT) {
-                    Ok(v) => (Some(v.value()), None),
+                    // Normalised here so nothing downstream has to know that
+                    // some monitors answer with the byte duplicated.
+                    Ok(v) => (Some(vcp::normalize_input_value(v.value())), None),
                     Err(e) => (None, Some(e.to_string())),
                 };
                 let (caps_text, caps_err) = if want_caps {
@@ -247,7 +249,7 @@ fn main() {
     // rather than treated as a fatal error.
     let read = |d: &mut Display| -> (Option<u16>, Option<String>) {
         match d.handle.get_vcp_feature(VCP_INPUT) {
-            Ok(v) => (Some(v.value()), None),
+            Ok(v) => (Some(vcp::normalize_input_value(v.value())), None),
             Err(e) => (None, Some(e.to_string())),
         }
     };

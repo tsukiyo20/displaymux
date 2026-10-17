@@ -104,8 +104,13 @@ on your `PATH` if you want it under the plain name.
 
 ### Installing a release
 
-Download the `.dmg` from the [releases page](https://github.com/tsukiyo20/displaymux/releases),
+Download a `.dmg` from the [releases page](https://github.com/tsukiyo20/displaymux/releases),
 open it, and drag `displaymux.app` to `/Applications`.
+
+Each release carries three: `macos-arm64`, `macos-x86_64`, and `macos-universal`.
+The universal one runs on either architecture and is the one to take if you do
+not want to think about it; the other two are smaller. The app itself always
+updates to the build for the machine it is running on.
 
 The bundles are signed ad-hoc rather than with a Developer ID and are not
 notarised, so the first launch of a downloaded copy is refused by Gatekeeper.
@@ -133,9 +138,14 @@ Publishing is a tag push: `.github/workflows/release.yml` builds and packages
 both platforms on `v*` and attaches the artifacts and checksums to the release.
 Nothing else has to be kept in sync.
 
-Windows builds are published as a zip and updated by hand: the app ships two
-executables, and replacing only the running one would leave the DDC helper
-behind. Add `LSUIElement` to the
+On Windows the release carries a zip, an NSIS installer (`-setup.exe`) and an
+MSI. All three are per-user: no administrator prompt, and everything lands under
+`%LOCALAPPDATA%\displaymux` where the GUI finds the DDC helper next to itself.
+
+Windows updates are by hand for now. The app ships two executables and the
+updater replaces only the running one, which would leave the DDC helper at the
+old version; until there is an installer to hand to `msiexec`, downloading a
+new one is the honest path. Add `LSUIElement` to the
 `Info.plist` the script writes if you would rather it were a pure menu bar app
 with no Dock icon.
 

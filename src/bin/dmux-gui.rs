@@ -84,7 +84,7 @@ mod gui {
     use gpui_kit::{
         div, point, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Entity, Global,
         IntoElement, QuitMode, SharedString, TitlebarOptions, WeakEntity, Window, WindowAppearance,
-        WindowBounds, WindowDecorations, WindowOptions,
+        WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
     };
     use rust_i18n::t;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -219,6 +219,12 @@ mod gui {
         lang_open: bool,
         /// Whether the appearance list is showing.
         theme_open: bool,
+        /// A release newer than this build, once a check has found one.
+        update_available: Option<displaymux::update::Available>,
+        /// Whether an update check is in flight.
+        checking_update: bool,
+        /// Whether this launch has already looked for a newer release.
+        update_checked: bool,
         theme: ThemeChoice,
         /// The appearance actually in force, after resolving "system".
         dark: bool,
@@ -240,6 +246,9 @@ mod gui {
                 editing: None,
                 lang_open: false,
                 theme_open: false,
+                update_available: None,
+                checking_update: false,
+                update_checked: false,
                 theme: ThemeChoice::from_setting(settings_theme.as_deref()),
                 dark: true,
             };
@@ -290,9 +299,14 @@ mod gui {
         /// past, and a tray that dies with the window leaves an icon whose menu
         /// does nothing at all -- not even quit.
         fn sync_tray(&mut self, cx: &mut Context<Self>) {
+            let available = self
+                .update_available
+                .as_ref()
+                .map(|a| a.version.to_string());
             let Some(tray) = cx.global_mut::<Installed>().tray.as_mut() else {
                 return;
             };
+            tray.set_update(available.as_deref());
             let display = self
                 .status
                 .as_ref()
@@ -322,6 +336,7 @@ mod gui {
                 // The menu bar is a second entrance to the same irreversible
                 // command, so it gets the same confirmation rather than firing
                 // straight from a menu click.
+                TrayEvent::CheckUpdates => self.open_update(cx),
                 TrayEvent::Switch(code) => {
                     let p = self.palette();
                     let name = self.input_name(&code);
@@ -385,6 +400,13 @@ mod gui {
                             self.index = s.display_index;
                         }
                         self.status = Some(s);
+                        // Once the window has something to show, look for a
+                        // newer release. Once per launch: a check on every
+                        // refresh would be noise, and the menu bar can re-run it.
+                        if !self.update_checked {
+                            self.update_checked = true;
+                            self.check_updates(cx);
+                        }
                     }
                     Err(e) => {
                         self.message = t!("read_failed", error = e.to_string().as_str()).into()
@@ -865,6 +887,313 @@ mod gui {
         }
     }
 
+    /// What the update window is showing.
+    #[derive(Clone)]
+    enum UpdateState {
+        Checking,
+        Latest,
+        Available(displaymux::update::Available),
+        Downloading(u8),
+        Restarting,
+        Failed(String),
+    }
+
+    /// The small window that checks for, downloads, and installs a release.
+    ///
+    /// Its own window for the same reason the confirmation is: the menu bar can
+    /// open it, and a dialog would drag the switcher forward with it.
+    struct UpdateView {
+        p: Palette,
+        state: UpdateState,
+        app: Option<WeakEntity<SwitchApp>>,
+    }
+
+    impl UpdateView {
+        fn new(
+            p: Palette,
+            initial: Option<displaymux::update::Available>,
+            app: Option<WeakEntity<SwitchApp>>,
+            _window: Option<gpui_kit::AnyWindowHandle>,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            let state = match initial {
+                Some(available) => UpdateState::Available(available),
+                None => UpdateState::Checking,
+            };
+            if matches!(state, UpdateState::Checking) {
+                // Opening straight from the menu bar means nothing has checked
+                // yet, so this window does it and reports what it finds.
+                cx.spawn(async move |this, cx| {
+                    let found = cx
+                        .background_spawn(async { displaymux::update::check() })
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.state = match found {
+                            Ok(Some(available)) => UpdateState::Available(available),
+                            Ok(None) => UpdateState::Latest,
+                            Err(e) => UpdateState::Failed(e),
+                        };
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            Self { p, state, app }
+        }
+
+        /// Download and install, reporting progress while it happens.
+        ///
+        /// The download runs on a background thread and publishes its percentage
+        /// through an atomic; a small poller in the UI turns that into a
+        /// redraw. Progress callbacks fire on the worker, which must not touch
+        /// the view.
+        fn install(&mut self, cx: &mut Context<Self>) {
+            if !matches!(self.state, UpdateState::Available(_)) {
+                return;
+            }
+            self.state = UpdateState::Downloading(0);
+            cx.notify();
+
+            let progress = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+
+            let watched = progress.clone();
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let percent = watched.load(std::sync::atomic::Ordering::Relaxed);
+                let running = this.update(cx, |view, cx| match view.state {
+                    UpdateState::Downloading(_) => {
+                        view.state = UpdateState::Downloading(percent);
+                        cx.notify();
+                        true
+                    }
+                    _ => false,
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            })
+            .detach();
+
+            let written = progress;
+            cx.spawn(async move |this, cx| {
+                let outcome = cx
+                    .background_spawn(async move {
+                        displaymux::update::install(move |done, total| {
+                            let percent = match total {
+                                Some(total) if total > 0 => {
+                                    (done.saturating_mul(100) / total).min(100) as u8
+                                }
+                                _ => 0,
+                            };
+                            written.store(percent, std::sync::atomic::Ordering::Relaxed);
+                        })
+                    })
+                    .await;
+                let restarting = match outcome {
+                    Ok(()) => true,
+                    Err(e) => {
+                        let _ = this.update(cx, |view: &mut UpdateView, cx| {
+                            view.state = UpdateState::Failed(e);
+                            cx.notify();
+                        });
+                        false
+                    }
+                };
+                if !restarting {
+                    return;
+                }
+                let _ = this.update(cx, |view: &mut UpdateView, cx| {
+                    view.state = UpdateState::Restarting;
+                    cx.notify();
+                    // The new build is already running: this process has
+                    // nothing left to do, and staying would leave two.
+                    cx.quit();
+                });
+            })
+            .detach();
+        }
+    }
+
+    impl Render for UpdateView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = self.p;
+            let app = self.app.clone();
+            let weak = cx.entity().downgrade();
+
+            let (line, detail, action): (String, Option<String>, Option<String>) = match &self.state
+            {
+                UpdateState::Checking => (t!("update_checking").to_string(), None, None),
+                UpdateState::Latest => (
+                    t!(
+                        "update_latest",
+                        version = displaymux::update::current().to_string()
+                    )
+                    .to_string(),
+                    None,
+                    None,
+                ),
+                UpdateState::Available(available) => (
+                    t!("update_available", version = available.version.to_string()).to_string(),
+                    Some(t!("update_body").to_string()),
+                    Some(t!("update_download").to_string()),
+                ),
+                UpdateState::Downloading(percent) => (
+                    t!("update_downloading", percent = *percent as usize).to_string(),
+                    None,
+                    None,
+                ),
+                UpdateState::Restarting => (t!("update_restarting").to_string(), None, None),
+                UpdateState::Failed(error) => (
+                    t!("update_failed", error = error.as_str()).to_string(),
+                    None,
+                    None,
+                ),
+            };
+
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .rounded_lg()
+                .bg(rgb(p.bg))
+                .text_color(rgb(p.text))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(38.0))
+                        .px(px(16.0))
+                        .border_b(px(1.0))
+                        .border_color(rgb(p.hairline))
+                        .child(
+                            Icon::default()
+                                .data(MARK_SVG)
+                                .text_color(rgb(p.accent))
+                                .with_size(Size::Size(px(13.0))),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(p.text_dim))
+                                .child(t!("update_title").to_string()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .p(px(16.0))
+                        .gap_2()
+                        .child(div().text_sm().child(line))
+                        .when_some(detail, |d, detail| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.text_faint))
+                                    .child(detail),
+                            )
+                        })
+                        .child(
+                            div()
+                                .mt_auto()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child({
+                                    let app = app.clone();
+                                    div()
+                                        .id("update-close")
+                                        .px_3()
+                                        .py(px(5.0))
+                                        .rounded_md()
+                                        .bg(rgb(p.surface_active))
+                                        .text_color(rgb(p.text_dim))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|s| s.opacity(0.85))
+                                        .child(t!("update_later").to_string())
+                                        .on_click(
+                                            move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                                if let Some(app) = app.clone() {
+                                                    let _ = app.update(cx, |_: &mut SwitchApp, cx| {
+                                                        cx.notify();
+                                                    });
+                                                }
+                                                window.remove_window();
+                                            },
+                                        )
+                                })
+                                .when_some(action, |d, action| {
+                                    d.child(
+                                        div()
+                                            .id("update-install")
+                                            .px_3()
+                                            .py(px(5.0))
+                                            .rounded_md()
+                                            .bg(rgb(p.accent))
+                                            .text_color(rgb(p.on_accent))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .hover(|s| s.opacity(0.9))
+                                            .child(action)
+                                            .on_click(
+                                                move |_e: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                                    let _ = weak.update(cx, |view: &mut UpdateView, cx| {
+                                                        view.install(cx);
+                                                    });
+                                                },
+                                            ),
+                                    )
+                                }),
+                        ),
+                )
+        }
+    }
+
+    /// Show the update window, centred and small.
+    fn open_update_window(
+        cx: &mut App,
+        p: Palette,
+        available: Option<displaymux::update::Available>,
+        app: Option<WeakEntity<SwitchApp>>,
+    ) {
+        if let Some(open) = cx.global::<Installed>().update_window {
+            if open.update(cx, |_, _, _| {}).is_ok() {
+                return;
+            }
+        }
+        let bounds = Bounds::centered(None, size(px(380.0), px(196.0)), cx);
+        let opened = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                titlebar: None,
+                is_resizable: false,
+                focus: true,
+                ..Default::default()
+            },
+            cx,
+            move |_window, cx| {
+                let available = available.clone();
+                let app = app.clone();
+                cx.new(move |cx| {
+                    let handle = cx.active_window();
+                    UpdateView::new(p, available, app, handle, cx)
+                })
+            },
+        );
+        if let Ok((handle, _)) = opened {
+            cx.global_mut::<Installed>().update_window = Some(handle);
+        }
+    }
+
     /// Show the confirmation in its own small window, centred.
     ///
     /// Shared by both entrances -- the Switch button and the menu bar -- so
@@ -914,6 +1243,40 @@ mod gui {
                 .and_then(|s| s.inputs.iter().find(|i| i.code == code))
                 .map(|i| format!("{} ({})", i.name, i.code))
                 .unwrap_or_else(|| code.to_string())
+        }
+
+        /// Look for a newer release without saying anything about failures.
+        ///
+        /// A background check that interrupts with "could not reach the
+        /// internet" is worse than one that stays quiet: the user did not ask.
+        fn check_updates(&mut self, cx: &mut Context<Self>) {
+            if self.checking_update {
+                return;
+            }
+            self.checking_update = true;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let found = cx
+                    .background_spawn(async { displaymux::update::check() })
+                    .await;
+                let _ = this.update(cx, |app: &mut SwitchApp, cx| {
+                    app.checking_update = false;
+                    if let Ok(Some(available)) = found {
+                        app.update_available = Some(available);
+                        app.sync_tray(cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        /// Open the update window seeded with whatever the check found.
+        fn open_update(&mut self, cx: &mut Context<Self>) {
+            let p = self.palette();
+            let available = self.update_available.clone();
+            let app = cx.entity().downgrade();
+            open_update_window(cx, p, available, Some(app));
         }
 
         fn palette(&self) -> Palette {
@@ -1095,6 +1458,10 @@ mod gui {
         fn title_bar(&self, p: Palette, cx: &Context<Self>) -> impl IntoElement {
             let weak = cx.entity().downgrade();
             let current = self.settings.locale.clone().unwrap_or_default();
+            let update_available = self
+                .update_available
+                .as_ref()
+                .map(|a| a.version.to_string());
 
             let theme_icon: gpui_kit::AnyElement = match self.theme {
                 ThemeChoice::Dark => Icon::new(IconName::Moon)
@@ -1191,11 +1558,39 @@ mod gui {
             } else {
                 let theme_weak = weak.clone();
                 let language_weak = weak.clone();
+                let update_weak = weak.clone();
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_1()
+                    .when_some(update_available, |d, version| {
+                        d.child(
+                            div()
+                                .id("update-badge")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py(px(3.0))
+                                .rounded_md()
+                                .bg(rgb(p.surface_active))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .child(
+                                    Icon::new(IconName::ArrowDown)
+                                        .text_color(rgb(p.accent))
+                                        .text_xs(),
+                                )
+                                .child(div().text_xs().text_color(rgb(p.text_dim)).child(version))
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let _ = update_weak.update(cx, |app: &mut SwitchApp, cx| {
+                                        app.open_update(cx);
+                                    });
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id("theme")
@@ -1411,6 +1806,8 @@ mod gui {
         /// The open confirmation, if any, so a second request does not stack.
         /// The open confirmation, if any, so a second request does not stack.
         confirm: Option<gpui_kit::AnyWindowHandle>,
+        /// The open update window, if any.
+        update_window: Option<gpui_kit::AnyWindowHandle>,
     }
 
     /// The languages this build ships.
@@ -1442,6 +1839,9 @@ mod gui {
                     TrayEvent::Switch(code) => {
                         cx.update(|cx| forward_to_view(cx, TrayEvent::Switch(code)))
                     }
+                    TrayEvent::CheckUpdates => {
+                        cx.update(|cx| forward_to_view(cx, TrayEvent::CheckUpdates))
+                    }
                 }
             }
         })
@@ -1463,6 +1863,19 @@ mod gui {
         // itself: the confirmation is its own window, so nothing has to be
         // brought forward for it. Port labels are unknown here, which is why
         // the code stands in for the name.
+        if let TrayEvent::CheckUpdates = event {
+            let choice = ThemeChoice::from_setting(Settings::load().theme.as_deref());
+            let dark = match choice {
+                ThemeChoice::Dark => true,
+                ThemeChoice::Light => false,
+                ThemeChoice::System => matches!(
+                    cx.window_appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                ),
+            };
+            let app = cx.global::<Installed>().app.clone();
+            open_update_window(cx, if dark { DARK } else { LIGHT }, None, app);
+        }
         if let TrayEvent::Switch(code) = event {
             let choice = ThemeChoice::from_setting(Settings::load().theme.as_deref());
             let dark = match choice {
@@ -1594,6 +2007,7 @@ mod gui {
                     app: None,
                     window: None,
                     confirm: None,
+                    update_window: None,
                 });
                 match installed {
                     // Without a tray there is nothing to bring the window back, so

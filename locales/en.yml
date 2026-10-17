@@ -22,6 +22,18 @@ switch: Switch
 save: Save
 cancel: Cancel
 
+update_title: Update
+update_checking: "checking for updates..."
+update_latest: "up to date (%{version})"
+update_available: "version %{version} is available"
+update_body: "Download it and restart into the new build."
+update_download: "Download and install"
+update_downloading: "downloading... %{percent}%"
+update_installing: "installing..."
+update_restarting: "restarting..."
+update_failed: "update failed: %{error}"
+update_later: Later
+tray_check_update: "Check for updates"
 tray_refresh: Refresh
 tray_show: Show window
 tray_quit: Quit dmux

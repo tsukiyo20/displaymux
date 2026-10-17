@@ -29,9 +29,12 @@ pub enum TrayEvent {
     Refresh,
     /// Show the main window.
     Show,
+    /// Open the small window that checks for and installs a newer release.
+    CheckUpdates,
     Quit,
 }
 
+const ID_CHECK_UPDATE: &str = "check-update";
 const ID_SWITCH_PREFIX: &str = "input:";
 const ID_REFRESH: &str = "refresh";
 const ID_SHOW: &str = "show";
@@ -137,6 +140,8 @@ pub struct Tray {
     _icon: TrayIcon,
     header: MenuItem,
     show: MenuItem,
+    /// "Check for updates", or "install %version" once one is waiting.
+    update: MenuItem,
     /// Input rows, rebuilt whenever the advertised list changes.
     rows: Vec<(String, MenuItem)>,
     menu: Menu,
@@ -153,6 +158,7 @@ impl Tray {
 
         let header = MenuItem::with_id(ID_HEADER, "dmux: reading monitor...", false, None);
         let refresh = MenuItem::with_id(ID_REFRESH, t!("tray_refresh"), true, None);
+        let update = MenuItem::with_id(ID_CHECK_UPDATE, t!("tray_check_update"), true, None);
         let show = MenuItem::with_id(ID_SHOW, "Show window", true, None);
         let quit = MenuItem::with_id(ID_QUIT, t!("tray_quit"), true, None);
 
@@ -161,6 +167,7 @@ impl Tray {
             &header,
             &PredefinedMenuItem::separator(),
             &refresh,
+            &update,
             &PredefinedMenuItem::separator(),
             &show,
             &quit,
@@ -193,6 +200,7 @@ impl Tray {
             _icon: icon,
             header,
             show,
+            update,
             rows: Vec::new(),
             menu,
         })
@@ -210,6 +218,15 @@ impl Tray {
     /// Rows are actions, not readings: nothing here says which input the
     /// monitor is actually on, because that cannot be known reliably (see the
     /// README's "How it works"). The header names the display and nothing else.
+    /// Label the update row for the state of the world: an available release
+    /// says so in the menu, where it is the most likely place to be noticed.
+    pub fn set_update(&mut self, available: Option<&str>) {
+        self.update.set_text(match available {
+            Some(version) => t!("update_available", version = version).to_string(),
+            None => t!("tray_check_update").to_string(),
+        });
+    }
+
     pub fn update(&mut self, display: &str, inputs: &[(String, String)]) {
         self.header.set_text(display);
         self.show.set_text(t!("tray_show"));
@@ -263,6 +280,7 @@ fn forward_events(tx: Sender<TrayEvent>) {
             } else {
                 match id {
                     ID_REFRESH => Some(TrayEvent::Refresh),
+                    ID_CHECK_UPDATE => Some(TrayEvent::CheckUpdates),
                     ID_SHOW => Some(TrayEvent::Show),
                     ID_QUIT => Some(TrayEvent::Quit),
                     _ => None,

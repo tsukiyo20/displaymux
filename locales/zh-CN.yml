@@ -21,6 +21,18 @@ switch: 切换
 save: 保存
 cancel: 取消
 
+update_title: 更新
+update_checking: "正在检查更新…"
+update_latest: "已是最新版本（%{version}）"
+update_available: "发现新版本 %{version}"
+update_body: "下载后会自动重启到新版本。"
+update_download: "下载并安装"
+update_downloading: "正在下载… %{percent}%"
+update_installing: "正在安装…"
+update_restarting: "正在重启…"
+update_failed: "更新失败：%{error}"
+update_later: 稍后
+tray_check_update: "检查更新"
 tray_refresh: 刷新
 tray_show: 显示窗口
 tray_quit: 退出 dmux

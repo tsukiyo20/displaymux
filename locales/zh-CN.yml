@@ -9,6 +9,9 @@ switch_failed_short: "显示器没有接受这次切换"
 switch_failed: "切换失败：%{error}"
 switching_to: "正在切换到 %{code}..."
 
+theme_dark: 深色
+theme_light: 浅色
+theme_system: 跟随系统
 confirm_title: "切换输入源"
 confirm_body: "把这块显示器切换到 %{name}？"
 confirm_note: "画面，以及接在显示器 hub 上的设备，都会转到那台电脑。"

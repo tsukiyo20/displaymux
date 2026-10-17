@@ -11,6 +11,10 @@ pub struct Settings {
     /// which case the UI keeps the compile-time default.
     #[serde(default)]
     pub locale: Option<String>,
+
+    /// `"dark"`, `"light"`, or absent for "follow the system".
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 fn path() -> Option<PathBuf> {

@@ -83,8 +83,8 @@ mod gui {
     // element and app types come from the same place as before.
     use gpui_kit::{
         div, point, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Entity, Global,
-        IntoElement, QuitMode, SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds,
-        WindowOptions,
+        IntoElement, QuitMode, SharedString, TitlebarOptions, WeakEntity, Window, WindowAppearance,
+        WindowBounds, WindowOptions,
     };
     use rust_i18n::t;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -217,12 +217,19 @@ mod gui {
         editing: Option<(String, Entity<InputState>)>,
         /// Whether the language list is showing.
         lang_open: bool,
+        /// Whether the appearance list is showing.
+        theme_open: bool,
+        theme: ThemeChoice,
+        /// The appearance actually in force, after resolving "system".
+        dark: bool,
     }
 
     impl SwitchApp {
         fn new(cx: &mut Context<Self>) -> Self {
             let worker = Worker::spawn();
             let _ = worker.tx.send(Request::Refresh);
+            let settings = Settings::load();
+            let settings_theme = settings.theme.clone();
             let app = SwitchApp {
                 worker,
                 status: None,
@@ -230,9 +237,12 @@ mod gui {
                 busy: true,
                 index: 0,
                 pending_input: None,
-                settings: Settings::load(),
+                settings,
                 editing: None,
                 lang_open: false,
+                theme_open: false,
+                theme: ThemeChoice::from_setting(settings_theme.as_deref()),
+                dark: true,
             };
             app.poll(cx);
             app
@@ -380,22 +390,91 @@ mod gui {
         }
     }
 
-    /// One place for the palette, so nothing drifts apart.
+    /// A full colour set. Two of them, chosen by the appearance in force.
     ///
     /// The accent is the amber from the application icon: it is the one colour
-    /// that already means "this tool" everywhere else it appears.
-    mod look {
-        pub const BG: u32 = 0x141419;
-        pub const SURFACE: u32 = 0x1d1d24;
-        pub const SURFACE_HOVER: u32 = 0x282832;
-        pub const SURFACE_ACTIVE: u32 = 0x32323e;
-        pub const HAIRLINE: u32 = 0x26262f;
-        pub const TEXT: u32 = 0xececf2;
-        pub const TEXT_DIM: u32 = 0x9a9aa8;
-        pub const TEXT_FAINT: u32 = 0x666673;
-        pub const ACCENT: u32 = 0xffb627;
-        pub const ON_ACCENT: u32 = 0x1a1205;
+    /// that already means "this tool" everywhere else it appears. On a light
+    /// background it has to be darker to keep any contrast against the surface,
+    /// which is the only place the two sets differ in intent rather than value.
+    #[derive(Clone, Copy)]
+    struct Palette {
+        bg: u32,
+        surface: u32,
+        surface_hover: u32,
+        surface_active: u32,
+        hairline: u32,
+        text: u32,
+        text_dim: u32,
+        text_faint: u32,
+        accent: u32,
+        on_accent: u32,
     }
+
+    const DARK: Palette = Palette {
+        bg: 0x141419,
+        surface: 0x1d1d24,
+        surface_hover: 0x282832,
+        surface_active: 0x32323e,
+        hairline: 0x26262f,
+        text: 0xececf2,
+        text_dim: 0x9a9aa8,
+        text_faint: 0x666673,
+        accent: 0xffb627,
+        on_accent: 0x1a1205,
+    };
+
+    const LIGHT: Palette = Palette {
+        bg: 0xf4f4f6,
+        surface: 0xffffff,
+        surface_hover: 0xeeeef2,
+        surface_active: 0xdfdfe6,
+        hairline: 0xdedee2,
+        text: 0x1b1b21,
+        text_dim: 0x5d5d69,
+        text_faint: 0x8e8e9a,
+        accent: 0xc47f00,
+        on_accent: 0xffffff,
+    };
+
+    /// What the user asked for, which may be "whatever the system is doing".
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ThemeChoice {
+        Dark,
+        Light,
+        System,
+    }
+
+    impl ThemeChoice {
+        const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+
+        fn from_setting(value: Option<&str>) -> Self {
+            match value {
+                Some("dark") => Self::Dark,
+                Some("light") => Self::Light,
+                _ => Self::System,
+            }
+        }
+
+        fn id(self) -> &'static str {
+            match self {
+                Self::Dark => "dark",
+                Self::Light => "light",
+                Self::System => "system",
+            }
+        }
+
+        fn label(self) -> String {
+            match self {
+                Self::Dark => t!("theme_dark").to_string(),
+                Self::Light => t!("theme_light").to_string(),
+                Self::System => t!("theme_system").to_string(),
+            }
+        }
+    }
+
+    /// Lucide's `sun-moon`, for the "follow the system" choice. The bundled
+    /// component icons have a sun and a moon but nothing that means "either".
+    const SUN_MOON_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8a2.83 2.83 0 0 0 4 4 4 4 0 1 1-4-4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.9 4.9 1.4 1.4"/><path d="m17.7 17.7 1.4 1.4"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.3 17.7-1.4 1.4"/><path d="m19.1 4.9-1.4 1.4"/></svg>"#;
 
     /// The application mark, redrawn for a 24px box in a single colour.
     ///
@@ -418,6 +497,7 @@ mod gui {
     /// where the peripherals hang off the monitor, the keyboard and mouse --
     /// away from this machine.
     fn input_row(
+        p: Palette,
         code: String,
         name: String,
         advertised: bool,
@@ -439,11 +519,11 @@ mod gui {
                     .size(px(24.0))
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                    .hover(|s| s.bg(rgb(p.surface_active)))
                     .child(
                         Icon::default()
                             .data(PENCIL_SVG)
-                            .text_color(rgb(look::TEXT_FAINT))
+                            .text_color(rgb(p.text_faint))
                             .text_sm(),
                     )
                     .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -465,18 +545,18 @@ mod gui {
                     .h(px(24.0))
                     .px_2()
                     .rounded_md()
-                    .bg(rgb(look::SURFACE_ACTIVE))
+                    .bg(rgb(p.surface_active))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x3c3c4a)))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(look::TEXT_DIM))
+                            .text_color(rgb(p.text_dim))
                             .child(t!("switch")),
                     )
                     .child(
                         Icon::new(IconName::ChevronRight)
-                            .text_color(rgb(look::TEXT_FAINT))
+                            .text_color(rgb(p.text_faint))
                             .text_xs(),
                     )
                     .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -498,26 +578,20 @@ mod gui {
             .px_3()
             .py(px(9.0))
             .rounded_lg()
-            .bg(rgb(look::SURFACE))
+            .bg(rgb(p.surface))
             .child(
                 div()
                     .w(px(34.0))
                     .text_sm()
-                    .text_color(rgb(look::TEXT_FAINT))
+                    .text_color(rgb(p.text_faint))
                     .child(code),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(rgb(look::TEXT))
-                    .child(name),
-            )
+            .child(div().flex_1().text_sm().text_color(rgb(p.text)).child(name))
             .when(!advertised, |d| {
                 d.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(look::TEXT_FAINT))
+                        .text_color(rgb(p.text_faint))
                         .child(t!("unlisted")),
                 )
             })
@@ -531,6 +605,7 @@ mod gui {
     /// footer is a static element: only an entity re-renders. It also owns the
     /// auto-fire, so "OK" and "ran out" take exactly the same path.
     struct ConfirmFooter {
+        p: Palette,
         left: u8,
         code: String,
         app: WeakEntity<SwitchApp>,
@@ -539,6 +614,7 @@ mod gui {
 
     impl ConfirmFooter {
         fn new(
+            p: Palette,
             code: String,
             app: WeakEntity<SwitchApp>,
             window: Option<gpui_kit::AnyWindowHandle>,
@@ -576,6 +652,7 @@ mod gui {
             .detach();
 
             Self {
+                p,
                 left: CONFIRM_SECONDS,
                 code,
                 app,
@@ -586,6 +663,7 @@ mod gui {
 
     impl Render for ConfirmFooter {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let p = self.p;
             let left = self.left;
             let code = self.code.clone();
             let app = self.app.clone();
@@ -603,8 +681,8 @@ mod gui {
                         .px_3()
                         .py(px(5.0))
                         .rounded_md()
-                        .bg(rgb(look::SURFACE_ACTIVE))
-                        .text_color(rgb(look::TEXT_DIM))
+                        .bg(rgb(p.surface_active))
+                        .text_color(rgb(p.text_dim))
                         .text_xs()
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(0x3c3c4a)))
@@ -624,8 +702,8 @@ mod gui {
                         .px_3()
                         .py(px(5.0))
                         .rounded_md()
-                        .bg(rgb(look::ACCENT))
-                        .text_color(rgb(look::ON_ACCENT))
+                        .bg(rgb(p.accent))
+                        .text_color(rgb(p.on_accent))
                         .text_xs()
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.9))
@@ -642,6 +720,14 @@ mod gui {
     }
 
     impl SwitchApp {
+        fn palette(&self) -> Palette {
+            if self.dark {
+                DARK
+            } else {
+                LIGHT
+            }
+        }
+
         /// Ask before switching.
         ///
         /// The Switch button in the dialog counts down and fires itself; the
@@ -662,7 +748,8 @@ mod gui {
                 .unwrap_or_else(|| code.clone());
             let app = cx.entity().downgrade();
             let window_handle = cx.active_window();
-            let footer = cx.new(|cx| ConfirmFooter::new(code, app, window_handle, cx));
+            let p = self.palette();
+            let footer = cx.new(|cx| ConfirmFooter::new(p, code, app, window_handle, cx));
             window.open_dialog(cx, move |dialog, _window, _cx| {
                 let footer = footer.clone();
                 let name = name.clone();
@@ -677,13 +764,13 @@ mod gui {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(look::TEXT))
+                                    .text_color(rgb(p.text))
                                     .child(t!("confirm_body", name = name.as_str()).to_string()),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(look::TEXT_FAINT))
+                                    .text_color(rgb(p.text_faint))
                                     .child(t!("confirm_note").to_string()),
                             )
                     })
@@ -719,6 +806,7 @@ mod gui {
             self.editing = Some((code.clone(), input.clone()));
 
             let weak = cx.entity().downgrade();
+            let p = self.palette();
             window.open_dialog(cx, move |dialog, _window, _cx| {
                 let input = input.clone();
                 let weak = weak.clone();
@@ -744,8 +832,8 @@ mod gui {
                                     .px_3()
                                     .py(px(5.0))
                                     .rounded_md()
-                                    .bg(rgb(look::ACCENT))
-                                    .text_color(rgb(look::ON_ACCENT))
+                                    .bg(rgb(p.accent))
+                                    .text_color(rgb(p.on_accent))
                                     .text_xs()
                                     .cursor_pointer()
                                     .hover(|s| s.opacity(0.9))
@@ -767,8 +855,8 @@ mod gui {
                                     .px_3()
                                     .py(px(5.0))
                                     .rounded_md()
-                                    .bg(rgb(look::SURFACE_ACTIVE))
-                                    .text_color(rgb(look::TEXT_DIM))
+                                    .bg(rgb(p.surface_active))
+                                    .text_color(rgb(p.text_dim))
                                     .text_xs()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(0x3c3c4a)))
@@ -817,6 +905,30 @@ mod gui {
             }
         }
 
+        fn choose_theme(&mut self, choice: ThemeChoice, cx: &mut Context<Self>) {
+            self.theme = choice;
+            self.dark = match choice {
+                ThemeChoice::Dark => true,
+                ThemeChoice::Light => false,
+                ThemeChoice::System => matches!(
+                    cx.window_appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                ),
+            };
+            // The component library keeps its own theme for the dialogs and the
+            // text fields; it has to follow ours.
+            let mode = if self.dark {
+                gpui_kit::component::theme::ThemeMode::Dark
+            } else {
+                gpui_kit::component::theme::ThemeMode::Light
+            };
+            gpui_kit::component::theme::Theme::change(mode, None, cx);
+            self.settings.theme = Some(choice.id().to_string());
+            let _ = self.settings.save();
+            self.theme_open = false;
+            cx.notify();
+        }
+
         fn choose_language(&mut self, tag: &'static str, cx: &mut Context<Self>) {
             // The locale is process-global, so this also changes the component
             // library's own strings.
@@ -834,11 +946,66 @@ mod gui {
         /// The language picker expands *in the bar* rather than floating over
         /// the content: a hand-positioned overlay is one layout change away
         /// from sitting under its own backdrop, and did.
-        fn title_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        fn title_bar(&self, p: Palette, cx: &Context<Self>) -> impl IntoElement {
             let weak = cx.entity().downgrade();
             let current = self.settings.locale.clone().unwrap_or_default();
 
-            let picker: gpui_kit::AnyElement = if self.lang_open {
+            let theme_icon: gpui_kit::AnyElement = match self.theme {
+                ThemeChoice::Dark => Icon::new(IconName::Moon)
+                    .text_color(rgb(p.text_dim))
+                    .with_size(Size::Size(px(16.0)))
+                    .into_any_element(),
+                ThemeChoice::Light => Icon::new(IconName::Sun)
+                    .text_color(rgb(p.text_dim))
+                    .with_size(Size::Size(px(16.0)))
+                    .into_any_element(),
+                ThemeChoice::System => Icon::default()
+                    .data(SUN_MOON_SVG)
+                    .text_color(rgb(p.text_dim))
+                    .with_size(Size::Size(px(16.0)))
+                    .into_any_element(),
+            };
+
+            // Only one list can be open at a time, so the header never has to
+            // fit both.
+            let picker: gpui_kit::AnyElement = if self.theme_open {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .children(ThemeChoice::ALL.iter().map(|choice| {
+                        let choice = *choice;
+                        let selected = choice == self.theme;
+                        let weak = weak.clone();
+                        div()
+                            .id(SharedString::from(format!("theme-{}", choice.id())))
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded_md()
+                            .bg(if selected {
+                                rgb(p.surface_active)
+                            } else {
+                                rgb(p.surface)
+                            })
+                            .text_xs()
+                            .text_color(if selected {
+                                rgb(p.text)
+                            } else {
+                                rgb(p.text_dim)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.surface_active)))
+                            .child(choice.label())
+                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                    app.choose_theme(choice, cx);
+                                });
+                            })
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            } else if self.lang_open {
                 div()
                     .flex()
                     .flex_row()
@@ -854,18 +1021,18 @@ mod gui {
                             .py(px(3.0))
                             .rounded_md()
                             .bg(if selected {
-                                rgb(look::SURFACE_ACTIVE)
+                                rgb(p.surface_active)
                             } else {
-                                rgb(look::SURFACE)
+                                rgb(p.surface)
                             })
                             .text_xs()
                             .text_color(if selected {
-                                rgb(look::TEXT)
+                                rgb(p.text)
                             } else {
-                                rgb(look::TEXT_DIM)
+                                rgb(p.text_dim)
                             })
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                            .hover(|s| s.bg(rgb(p.surface_active)))
                             .child(*name)
                             .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
                                 let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
@@ -876,28 +1043,56 @@ mod gui {
                     }))
                     .into_any_element()
             } else {
-                let weak = weak.clone();
+                let theme_weak = weak.clone();
+                let language_weak = weak.clone();
                 div()
-                    .id("language")
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .size(px(28.0))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                    .gap_1()
                     .child(
-                        Icon::default()
-                            .data(LANGUAGES_SVG)
-                            .text_color(rgb(look::TEXT_DIM))
-                            .with_size(Size::Size(px(17.0))),
+                        div()
+                            .id("theme")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.surface_hover)))
+                            .child(theme_icon)
+                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                let _ = theme_weak.update(cx, |app: &mut SwitchApp, cx| {
+                                    app.theme_open = true;
+                                    app.lang_open = false;
+                                    cx.notify();
+                                });
+                            }),
                     )
-                    .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                            app.lang_open = true;
-                            cx.notify();
-                        });
-                    })
+                    .child(
+                        div()
+                            .id("language")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.surface_hover)))
+                            .child(
+                                Icon::default()
+                                    .data(LANGUAGES_SVG)
+                                    .text_color(rgb(p.text_dim))
+                                    .with_size(Size::Size(px(17.0))),
+                            )
+                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                let _ = language_weak.update(cx, |app: &mut SwitchApp, cx| {
+                                    app.lang_open = true;
+                                    app.theme_open = false;
+                                    cx.notify();
+                                });
+                            }),
+                    )
                     .into_any_element()
             };
 
@@ -910,7 +1105,7 @@ mod gui {
                 .pl(px(88.0))
                 .pr(px(12.0))
                 .border_b(px(1.0))
-                .border_color(rgb(look::HAIRLINE))
+                .border_color(rgb(p.hairline))
                 .child(
                     div()
                         .flex()
@@ -920,20 +1115,20 @@ mod gui {
                         .child(
                             Icon::default()
                                 .data(MARK_SVG)
-                                .text_color(rgb(look::ACCENT))
+                                .text_color(rgb(p.accent))
                                 .with_size(Size::Size(px(17.0))),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(look::TEXT_DIM))
+                                .text_color(rgb(p.text_dim))
                                 .child("displaymux"),
                         ),
                 )
                 .child(picker)
         }
 
-        fn main_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        fn main_pane(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
             let weak = cx.entity().downgrade();
             let busy = self.busy;
             let message = self.message.clone();
@@ -949,7 +1144,13 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
-                            input_row(i.code.clone(), i.name.clone(), i.advertised, weak.clone())
+                            input_row(
+                                p,
+                                i.code.clone(),
+                                i.name.clone(),
+                                i.advertised,
+                                weak.clone(),
+                            )
                         })
                         .collect()
                 })
@@ -959,7 +1160,7 @@ mod gui {
                 .flex()
                 .flex_col()
                 .size_full()
-                .child(self.title_bar(cx))
+                .child(self.title_bar(p, cx))
                 .child(
                     div()
                         .flex()
@@ -969,16 +1170,11 @@ mod gui {
                         .px(px(14.0))
                         .pt(px(12.0))
                         .pb(px(8.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(look::TEXT_FAINT))
-                                .child(display),
-                        )
+                        .child(div().text_xs().text_color(rgb(p.text_faint)).child(display))
                         .child(if busy {
                             div()
                                 .text_xs()
-                                .text_color(rgb(look::ACCENT))
+                                .text_color(rgb(p.accent))
                                 .child(t!("working"))
                                 .into_any_element()
                         } else {
@@ -991,10 +1187,10 @@ mod gui {
                                 .size(px(28.0))
                                 .rounded_md()
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                                .hover(|s| s.bg(rgb(p.surface_hover)))
                                 .child(
                                     Icon::new(IconName::RefreshCw)
-                                        .text_color(rgb(look::TEXT_DIM))
+                                        .text_color(rgb(p.text_dim))
                                         .text_sm(),
                                 )
                                 .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
@@ -1020,7 +1216,7 @@ mod gui {
                         .px(px(16.0))
                         .pb(px(14.0))
                         .text_xs()
-                        .text_color(rgb(look::TEXT_FAINT))
+                        .text_color(rgb(p.text_faint))
                         .child(message),
                 )
                 .into_any_element()
@@ -1028,12 +1224,23 @@ mod gui {
     }
 
     impl Render for SwitchApp {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // Resolved every frame, so "follow the system" tracks an appearance
+            // change without needing a subscription.
+            self.dark = match self.theme {
+                ThemeChoice::Dark => true,
+                ThemeChoice::Light => false,
+                ThemeChoice::System => matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                ),
+            };
+            let p = self.palette();
             div()
                 .size_full()
-                .bg(rgb(look::BG))
-                .text_color(rgb(look::TEXT))
-                .child(self.main_pane(cx))
+                .bg(rgb(p.bg))
+                .text_color(rgb(p.text))
+                .child(self.main_pane(p, cx))
         }
     }
 
@@ -1179,20 +1386,32 @@ mod gui {
                 // components, assets). Must run before any window is opened.
                 gpui_kit::init(cx);
 
-                // The component library ships a light theme by default; this window is
-                // dark throughout, so its inputs would otherwise render as white boxes.
+                // Everything the user chose last time, before any of it can be
+                // seen: the component library keeps its own theme for dialogs and
+                // text fields, and the locale is process-global.
+                let saved = displaymux::settings::Settings::load();
+                let choice = ThemeChoice::from_setting(saved.theme.as_deref());
+                let dark = match choice {
+                    ThemeChoice::Dark => true,
+                    ThemeChoice::Light => false,
+                    ThemeChoice::System => matches!(
+                        cx.window_appearance(),
+                        WindowAppearance::Dark | WindowAppearance::VibrantDark
+                    ),
+                };
                 gpui_kit::component::theme::Theme::change(
-                    gpui_kit::component::theme::ThemeMode::Dark,
+                    if dark {
+                        gpui_kit::component::theme::ThemeMode::Dark
+                    } else {
+                        gpui_kit::component::theme::ThemeMode::Light
+                    },
                     None,
                     cx,
                 );
-
-                // A saved language wins over the compile-time default. The locale is
-                // process-global, so this also switches the component library's own
-                // strings (dialog buttons, date pickers) in one call.
-                if let Some(tag) = displaymux::settings::Settings::load().locale {
+                if let Some(tag) = saved.locale.clone() {
                     rust_i18n::set_locale(&tag);
                 }
+
                 // The status item has to be created here: on macOS it needs the main
                 // thread with an event loop already running, which is exactly what
                 // the `run` closure provides. It goes in before the window so that

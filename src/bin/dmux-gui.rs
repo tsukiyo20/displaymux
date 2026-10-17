@@ -355,22 +355,25 @@ mod gui {
                         self.message = t!("read_failed", error = e.to_string().as_str()).into()
                     }
                 },
-                Response::Switched(r) => match *r {
-                    Ok(note) => {
-                        // The write was accepted, which is all that can honestly
-                        // be claimed from here: the monitor may act on it, and
-                        // once it does this host loses the display entirely.
-                        self.pending_input.take();
-                        self.message = match note {
-                            SwitchNote::Silent => String::new().into(),
-                            SwitchNote::Reverted => t!("reverted").to_string().into(),
-                            SwitchNote::Failed => t!("switch_failed_short").to_string().into(),
-                        };
+                Response::Switched(r) => {
+                    match *r {
+                        Ok(note) => {
+                            // The write was accepted, which is all that can honestly
+                            // be claimed from here: the monitor may act on it, and
+                            // once it does this host loses the display entirely.
+                            self.pending_input.take();
+                            self.message = match note {
+                                SwitchNote::Silent => String::new().into(),
+                                SwitchNote::Reverted => t!("reverted").to_string().into(),
+                                SwitchNote::Failed => t!("switch_failed_short").to_string().into(),
+                            };
+                        }
+                        Err(e) => {
+                            self.message =
+                                t!("switch_failed", error = e.to_string().as_str()).into()
+                        }
                     }
-                    Err(e) => {
-                        self.message = t!("switch_failed", error = e.to_string().as_str()).into()
-                    }
-                },
+                }
             }
             self.sync_tray(cx);
         }
@@ -627,6 +630,31 @@ mod gui {
         window: Option<gpui_kit::AnyWindowHandle>,
     }
 
+    /// Send the switch, whether or not there is a view to route it through.
+    ///
+    /// A weak reference can be alive when the confirmation opens and dead by the
+    /// time it is answered -- the main window may have closed in between. The
+    /// update has to be *checked*, not assumed: swallowing its error is how the
+    /// menu bar came to confirm a switch and then do nothing.
+    fn dispatch_switch(app: Option<WeakEntity<SwitchApp>>, code: String, cx: &mut App) {
+        if let Some(app) = app {
+            if app
+                .update(cx, |app: &mut SwitchApp, cx| {
+                    app.fire_switch(code.clone(), cx)
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        // Nothing to drive it, so ask the monitor directly -- one shot, like
+        // every other write.
+        cx.background_spawn(async move {
+            let _ = displaymux::ddc::set_input(0, &code, Duration::from_secs(12));
+        })
+        .detach();
+    }
+
     impl ConfirmView {
         fn new(
             p: Palette,
@@ -659,22 +687,7 @@ mod gui {
                     let code = view.code.clone();
                     let app = view.app.clone();
                     let window = view.window;
-                    match app {
-                        Some(app) => {
-                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
-                                app.fire_switch(code.clone(), cx)
-                            });
-                        }
-                        // No window to drive the switch through, so ask the
-                        // monitor directly -- one shot, like every other write.
-                        None => {
-                            cx.background_spawn(async move {
-                                let _ =
-                                    displaymux::ddc::set_input(0, &code, Duration::from_secs(12));
-                            })
-                            .detach();
-                        }
-                    }
+                    dispatch_switch(app, code, cx);
                     if let Some(window) = window {
                         let _ = window.update(cx, |_, window, cx| ConfirmView::dismiss(window, cx));
                     }
@@ -807,21 +820,7 @@ mod gui {
                                 .child(t!("confirm_switch", count = left))
                                 .on_click(
                                     move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                        let code = code.clone();
-                                        if let Some(app) = app.clone() {
-                                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
-                                                app.fire_switch(code, cx);
-                                            });
-                                        } else {
-                                            cx.background_spawn(async move {
-                                                let _ = displaymux::ddc::set_input(
-                                                    0,
-                                                    &code,
-                                                    Duration::from_secs(12),
-                                                );
-                                            })
-                                            .detach();
-                                        }
+                                        dispatch_switch(app.clone(), code.clone(), cx);
                                         ConfirmView::dismiss(window, cx);
                                     },
                                 )

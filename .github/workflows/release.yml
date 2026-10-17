@@ -38,10 +38,13 @@ jobs:
         run: ./tools/bundle-macos.sh --dmg
 
       # The updater asks for SHA256SUMS and refuses a download it cannot check.
+      # It covers the artifacts the app installs, which is the macOS image; the
+      # Windows zip is a manual download and is deliberately not advertised as
+      # covered by a file that does not mention it.
       - name: Checksums
         run: |
           cd target/release/dist
-          shasum -a 256 ./*.dmg > SHA256SUMS
+          shasum -a 256 ./*.dmg | sed 's|  .*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2

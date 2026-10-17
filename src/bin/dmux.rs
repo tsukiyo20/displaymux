@@ -423,10 +423,7 @@ fn cmd_update(args: &[String]) -> Result<(), DdcError> {
 
     match displaymux::update::check().map_err(wrap)? {
         None => {
-            println!(
-                "up to date ({} is the latest release)",
-                displaymux::update::current()
-            );
+            println!("up to date (running {})", displaymux::update::current());
             Ok(())
         }
         Some(available) => {

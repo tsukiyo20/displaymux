@@ -1025,15 +1025,7 @@ mod gui {
             let (line, detail, action): (String, Option<String>, Option<String>) = match &self.state
             {
                 UpdateState::Checking => (t!("update_checking").to_string(), None, None),
-                UpdateState::Latest => (
-                    t!(
-                        "update_latest",
-                        version = displaymux::update::current().to_string()
-                    )
-                    .to_string(),
-                    None,
-                    None,
-                ),
+                UpdateState::Latest => (t!("update_latest").to_string(), None, None),
                 UpdateState::Available(available) => (
                     t!("update_available", version = available.version.to_string()).to_string(),
                     Some(t!("update_body").to_string()),

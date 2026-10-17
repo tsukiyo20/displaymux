@@ -24,7 +24,7 @@ cancel: Cancel
 
 update_title: Update
 update_checking: "checking for updates..."
-update_latest: "up to date (%{version})"
+update_latest: "up to date"
 update_available: "version %{version} is available"
 update_body: "Download it and restart into the new build."
 update_download: "Download and install"

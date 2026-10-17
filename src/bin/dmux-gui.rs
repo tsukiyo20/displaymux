@@ -208,11 +208,12 @@ mod gui {
         index: usize,
         /// The target of an in-flight switch, remembered once it is accepted.
         pending_input: Option<String>,
-        view: View,
         settings: Settings,
-        /// One text field per port while the settings pane is open. Built on
+        /// The one port whose label is being edited, with its field. Built on
         /// demand because `InputState` needs the window that renders it.
-        editors: Vec<(String, Entity<InputState>)>,
+        editing: Option<(String, Entity<InputState>)>,
+        /// Whether the language list is showing.
+        lang_open: bool,
     }
 
     impl SwitchApp {
@@ -226,9 +227,9 @@ mod gui {
                 busy: true,
                 index: 0,
                 pending_input: None,
-                view: View::Main,
                 settings: Settings::load(),
-                editors: Vec::new(),
+                editing: None,
+                lang_open: false,
             };
             app.poll(cx);
             app
@@ -376,16 +377,11 @@ mod gui {
         }
     }
 
-    /// One switchable input. Deliberately carries no state: the row is an
-    /// action, not a reading.
-    /// One place for the palette, so the two panes cannot drift apart.
-    ///
-    /// The accent is the amber from the application icon: it is the one colour
-    /// that already means "this tool" everywhere else it appears.
     mod look {
         pub const BG: u32 = 0x141419;
         pub const SURFACE: u32 = 0x1d1d24;
         pub const SURFACE_HOVER: u32 = 0x282832;
+        pub const SURFACE_ACTIVE: u32 = 0x32323e;
         pub const HAIRLINE: u32 = 0x26262f;
         pub const TEXT: u32 = 0xececf2;
         pub const TEXT_DIM: u32 = 0x9a9aa8;
@@ -399,41 +395,24 @@ mod gui {
     /// `Icon` tints the whole SVG with one colour, so a two-tone mark would be
     /// flattened into a grey smear at this size. Same geometry, one colour,
     /// tinted with the accent instead.
-    const MARK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5.4V9.5L12 14.1"/><path d="M8 3.2V9.5L12 14.1V20.8"/></svg>"#;
+    /// Lucide's pencil, inline: the bundled component icons have no pencil.
+    const PENCIL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>"#;
 
-    /// A square, borderless icon button. Used for every action in the chrome.
-    fn icon_button(
-        id: &'static str,
-        icon: IconName,
-        weak: WeakEntity<SwitchApp>,
-        on_click: fn(&mut SwitchApp, &mut Context<SwitchApp>),
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(28.0))
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-            .child(Icon::new(icon).text_color(rgb(look::TEXT_DIM)).text_sm())
-            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                let _ = weak.update(cx, |app: &mut SwitchApp, cx| on_click(app, cx));
-            })
-    }
+    const MARK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5.4V9.5L12 14.1"/><path d="M8 3.2V9.5L12 14.1V20.8"/></svg>"#;
 
     /// One switchable input.
     ///
-    /// A row is an action, never a reading: it carries the port, its name and a
-    /// chevron, and nothing that claims to know where the display is.
+    /// A row is an action, never a reading. The trailing pencil edits the
+    /// label in place, which is where the label belongs: the name describes
+    /// this port, so it is edited next to it rather than in a separate pane.
     fn input_row(
         code: String,
         name: String,
         advertised: bool,
+        editor: Option<Entity<InputState>>,
         weak: WeakEntity<SwitchApp>,
-    ) -> impl IntoElement {
-        div()
+    ) -> gpui_kit::AnyElement {
+        let row = div()
             .id(SharedString::from(format!("input-{}", code)))
             .flex()
             .flex_row()
@@ -452,108 +431,112 @@ mod gui {
                     .text_sm()
                     .text_color(rgb(look::TEXT_FAINT))
                     .child(code.clone()),
-            )
-            .child(
+            );
+
+        if let Some(editor) = editor {
+            return row
+                .child(div().flex_1().child(Input::new(&editor)))
+                .into_any_element();
+        }
+
+        row.child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(look::TEXT))
+                .child(name),
+        )
+        .when(!advertised, |d| {
+            d.child(
                 div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(rgb(look::TEXT))
-                    .child(name),
-            )
-            .when(!advertised, |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(look::TEXT_FAINT))
-                        .child(t!("unlisted")),
-                )
-            })
-            .child(
-                Icon::new(IconName::ChevronRight)
+                    .text_xs()
                     .text_color(rgb(look::TEXT_FAINT))
-                    .text_sm(),
+                    .child(t!("unlisted")),
             )
-            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                let code = code.clone();
-                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                    app.send(
-                        Request::Switch {
-                            index: app.index,
-                            code: code.clone(),
-                        },
-                        t!("switching_to", code = code.as_str()),
-                        cx,
-                    );
-                });
-            })
+        })
+        .child({
+            let weak = weak.clone();
+            let code = code.clone();
+            div()
+                .id(SharedString::from(format!("edit-{}", code)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.0))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                .child(
+                    Icon::default()
+                        .data(PENCIL_SVG)
+                        .text_color(rgb(look::TEXT_FAINT))
+                        .text_sm(),
+                )
+                .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let code = code.clone();
+                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                        app.start_editing(code, window, cx);
+                    });
+                })
+        })
+        .child(
+            Icon::new(IconName::ChevronRight)
+                .text_color(rgb(look::TEXT_FAINT))
+                .text_sm(),
+        )
+        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+            let code = code.clone();
+            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                app.send(
+                    Request::Switch {
+                        index: app.index,
+                        code: code.clone(),
+                    },
+                    t!("switching_to", code = code.as_str()),
+                    cx,
+                );
+            });
+        })
+        .into_any_element()
     }
 
     impl SwitchApp {
-        /// Enter the settings pane. The text fields are built during render,
-        /// because `InputState` needs the window that will host it.
-        fn open_settings(&mut self, cx: &mut Context<Self>) {
-            self.editors.clear();
-            self.view = View::Settings;
-            cx.notify();
-        }
-
-        fn cancel_settings(&mut self, cx: &mut Context<Self>) {
-            self.editors.clear();
-            self.view = View::Main;
-            cx.notify();
-        }
-
-        /// One text field per advertised port, seeded with the current label.
-        fn ensure_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-            if !self.editors.is_empty() {
-                return;
-            }
-            let inputs: Vec<(String, String)> = self
+        /// Begin editing one port's label.
+        fn start_editing(&mut self, code: String, window: &mut Window, cx: &mut Context<Self>) {
+            let current = self
                 .status
                 .as_ref()
-                .map(|s| {
-                    s.inputs
-                        .iter()
-                        .map(|i| (i.code.clone(), i.name.clone()))
-                        .collect()
-                })
+                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
+                .map(|i| i.name.clone())
                 .unwrap_or_default();
-            for (code, name) in inputs {
-                let editor = cx.new(|cx| InputState::new(window, cx).default_value(name));
-                self.editors.push((code, editor));
-            }
+            let editor = cx.new(|cx| InputState::new(window, cx).default_value(current));
+            self.editing = Some((code, editor));
+            cx.notify();
         }
 
-        /// Write every field to labels.json and reload.
+        /// Persist the label for the row being edited, then reload.
         ///
-        /// An empty field removes the label rather than storing an empty one, so
-        /// the port falls back to the name the monitor reports.
-        fn save_labels(&mut self, cx: &mut Context<Self>) {
+        /// An empty field, or one that still holds the name the monitor reports,
+        /// removes the label instead of freezing that name in place.
+        fn commit_edit(&mut self, cx: &mut Context<Self>) {
+            let Some((code, editor)) = self.editing.take() else {
+                return;
+            };
             let Some(display) = self.status.as_ref().map(|s| s.display_id.clone()) else {
                 return;
             };
+            let text = editor.read(cx).value().trim().to_string();
+            let mccs = u16::from_str_radix(code.trim_start_matches("0x"), 16)
+                .map(displaymux::vcp::input_name)
+                .unwrap_or_default();
             let mut labels = Labels::load();
-            for (code, editor) in &self.editors {
-                let text = editor.read(cx).value().trim().to_string();
-                // A field that still holds the MCCS name is not a label: writing
-                // it would pin the name the monitor reports and stop it following
-                // the hardware. Only a real difference is worth persisting.
-                let mccs = u16::from_str_radix(code.trim_start_matches("0x"), 16)
-                    .map(displaymux::vcp::input_name)
-                    .unwrap_or_default();
-                if text.is_empty() || text == mccs {
-                    labels.clear(&display, code);
-                } else {
-                    labels.set(&display, code, &text);
-                }
+            if text.is_empty() || text == mccs {
+                labels.clear(&display, &code);
+            } else {
+                labels.set(&display, &code, &text);
             }
             match labels.save() {
-                Ok(_) => {
-                    self.editors.clear();
-                    self.view = View::Main;
-                    self.send(Request::Refresh, t!("reading"), cx);
-                    self.message = String::new().into();
-                }
+                Ok(_) => self.send(Request::Refresh, t!("reading"), cx),
                 Err(e) => {
                     self.message = t!("read_failed", error = e.to_string().as_str()).into();
                     cx.notify();
@@ -567,17 +550,20 @@ mod gui {
             rust_i18n::set_locale(tag);
             self.settings.locale = Some(tag.to_string());
             let _ = self.settings.save();
+            self.lang_open = false;
             // The menu bar was built with the previous language.
             self.sync_tray(cx);
             cx.notify();
         }
 
-        /// The custom title bar: the mark, the name, and the one global action.
+        /// The custom title bar: the mark, the name, and the language picker.
         ///
         /// The window is created with a transparent system titlebar and the
         /// traffic lights pushed right, so this strip is where they sit and the
         /// content starts after them.
         fn title_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+            let weak = cx.entity().downgrade();
+            let current = self.settings.locale.clone().unwrap_or_default();
             div()
                 .flex()
                 .flex_row()
@@ -607,12 +593,107 @@ mod gui {
                                 .child("displaymux"),
                         ),
                 )
-                .child(icon_button(
-                    "open-settings",
-                    IconName::Settings,
-                    cx.entity().downgrade(),
-                    |app, cx| app.open_settings(cx),
-                ))
+                .child({
+                    let weak = weak.clone();
+                    div()
+                        .id("language")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(4.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                        .child(
+                            Icon::new(IconName::Globe)
+                                .text_color(rgb(look::TEXT_DIM))
+                                .text_sm(),
+                        )
+                        .child(div().text_xs().text_color(rgb(look::TEXT_FAINT)).child(
+                            if current.is_empty() {
+                                "EN".to_string()
+                            } else {
+                                current.to_uppercase()
+                            },
+                        ))
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.lang_open = !app.lang_open;
+                                cx.notify();
+                            });
+                        })
+                })
+        }
+
+        /// The language list, drawn over the content under the title bar.
+        fn language_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+            let weak = cx.entity().downgrade();
+            let current = self.settings.locale.clone().unwrap_or_default();
+            let options: Vec<gpui_kit::AnyElement> = LOCALES
+                .iter()
+                .map(|(tag, name)| {
+                    let tag = *tag;
+                    let selected = tag == current;
+                    let weak = weak.clone();
+                    div()
+                        .id(SharedString::from(format!("lang-{tag}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py(px(7.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                        .when(selected, |d| d.bg(rgb(look::SURFACE_ACTIVE)))
+                        .child(div().text_sm().text_color(rgb(look::TEXT)).child(*name))
+                        .when(selected, |d| {
+                            d.child(
+                                Icon::new(IconName::Check)
+                                    .text_color(rgb(look::ACCENT))
+                                    .text_sm(),
+                            )
+                        })
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.choose_language(tag, cx);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+
+            div()
+                .absolute()
+                .inset_0()
+                .child({
+                    let weak = weak.clone();
+                    div().absolute().inset_0().on_mouse_down(
+                        gpui_kit::MouseButton::Left,
+                        move |_e, _w, cx| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.lang_open = false;
+                                cx.notify();
+                            });
+                        },
+                    )
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(50.0))
+                        .right(px(10.0))
+                        .w(px(168.0))
+                        .p_1()
+                        .rounded_lg()
+                        .bg(rgb(look::SURFACE))
+                        .border_1()
+                        .border_color(rgb(look::HAIRLINE))
+                        .children(options),
+                )
         }
 
         fn main_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -624,6 +705,8 @@ mod gui {
                 .as_ref()
                 .map(|s| s.display_id.clone())
                 .unwrap_or_else(|| t!("no_monitor").to_string());
+            let editing = self.editing.as_ref().map(|(code, _)| code.clone());
+            let editor = self.editing.as_ref().map(|(_, e)| e.clone());
 
             let rows: Vec<gpui_kit::AnyElement> = self
                 .status
@@ -632,8 +715,18 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
-                            input_row(i.code.clone(), i.name.clone(), i.advertised, weak.clone())
-                                .into_any_element()
+                            let this_editor = if editing.as_deref() == Some(i.code.as_str()) {
+                                editor.clone()
+                            } else {
+                                None
+                            };
+                            input_row(
+                                i.code.clone(),
+                                i.name.clone(),
+                                i.advertised,
+                                this_editor,
+                                weak.clone(),
+                            )
                         })
                         .collect()
                 })
@@ -654,12 +747,10 @@ mod gui {
                         .pt(px(12.0))
                         .pb(px(8.0))
                         .child(
-                            div().flex().flex_row().items_center().gap_1().child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(look::TEXT_FAINT))
-                                    .child(display),
-                            ),
+                            div()
+                                .text_xs()
+                                .text_color(rgb(look::TEXT_FAINT))
+                                .child(display),
                         )
                         .child(if busy {
                             div()
@@ -668,10 +759,27 @@ mod gui {
                                 .child(t!("working"))
                                 .into_any_element()
                         } else {
-                            icon_button("refresh", IconName::RefreshCw, weak.clone(), |app, cx| {
-                                app.send(Request::Refresh, t!("reading"), cx);
-                            })
-                            .into_any_element()
+                            let weak = weak.clone();
+                            div()
+                                .id("refresh")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(28.0))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                                .child(
+                                    Icon::new(IconName::RefreshCw)
+                                        .text_color(rgb(look::TEXT_DIM))
+                                        .text_sm(),
+                                )
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                        app.send(Request::Refresh, t!("reading"), cx);
+                                    });
+                                })
+                                .into_any_element()
                         }),
                 )
                 .child(
@@ -686,200 +794,63 @@ mod gui {
                 .child(
                     div()
                         .mt_auto()
-                        .px(px(16.0))
-                        .pb(px(14.0))
-                        .text_xs()
-                        .text_color(rgb(look::TEXT_FAINT))
-                        .child(message),
-                )
-                .into_any_element()
-        }
-
-        fn settings_pane(
-            &mut self,
-            window: &mut Window,
-            cx: &mut Context<Self>,
-        ) -> gpui_kit::AnyElement {
-            self.ensure_editors(window, cx);
-            let weak = cx.entity().downgrade();
-            let current = self.settings.locale.clone().unwrap_or_default();
-
-            let languages: Vec<gpui_kit::AnyElement> = LOCALES
-                .iter()
-                .map(|(tag, name)| {
-                    let tag = *tag;
-                    let selected = tag == current;
-                    let weak = weak.clone();
-                    div()
-                        .id(SharedString::from(format!("lang-{tag}")))
-                        .px_3()
-                        .py(px(6.0))
-                        .rounded_md()
-                        .bg(if selected {
-                            rgb(look::SURFACE_HOVER)
-                        } else {
-                            rgb(look::SURFACE)
-                        })
-                        .border_1()
-                        .border_color(if selected {
-                            rgb(look::ACCENT)
-                        } else {
-                            rgb(look::HAIRLINE)
-                        })
-                        .text_sm()
-                        .text_color(if selected {
-                            rgb(look::TEXT)
-                        } else {
-                            rgb(look::TEXT_DIM)
-                        })
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-                        .child(*name)
-                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.choose_language(tag, cx);
-                            });
-                        })
-                        .into_any_element()
-                })
-                .collect();
-
-            let fields: Vec<gpui_kit::AnyElement> = self
-                .editors
-                .iter()
-                .map(|(code, editor)| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .w(px(34.0))
-                                .text_sm()
-                                .text_color(rgb(look::TEXT_FAINT))
-                                .child(code.clone()),
-                        )
-                        .child(div().flex_1().child(Input::new(editor)))
-                        .into_any_element()
-                })
-                .collect();
-
-            div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .child(
-                    div()
                         .flex()
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .h(px(56.0))
-                        .pl(px(88.0))
-                        .pr(px(12.0))
-                        .border_b(px(1.0))
-                        .border_color(rgb(look::HAIRLINE))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(look::TEXT_DIM))
-                                .child(t!("settings")),
-                        )
-                        .child(icon_button(
-                            "close-settings",
-                            IconName::ArrowLeft,
-                            weak.clone(),
-                            |app, cx| app.cancel_settings(cx),
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .px(px(14.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(64.0))
-                                        .text_xs()
-                                        .text_color(rgb(look::TEXT_FAINT))
-                                        .child(t!("language")),
-                                )
-                                .children(languages),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(look::TEXT_FAINT))
-                                        .child(t!("port_labels")),
-                                )
-                                .children(fields)
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(look::TEXT_FAINT))
-                                        .child(t!("port_labels_hint")),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .mt_auto()
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap_2()
-                        .px(px(14.0))
+                        .px(px(16.0))
                         .pb(px(14.0))
-                        .child({
-                            let weak = weak.clone();
+                        .child(
                             div()
-                                .id("save")
-                                .px_3()
-                                .py(px(6.0))
-                                .rounded_md()
-                                .bg(rgb(look::ACCENT))
-                                .text_color(rgb(0x1a1205))
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(|s| s.opacity(0.9))
-                                .child(t!("save"))
-                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                        app.save_labels(cx);
-                                    });
-                                })
-                        })
-                        .child({
-                            let weak = weak.clone();
-                            div()
-                                .id("cancel")
-                                .px_3()
-                                .py(px(6.0))
-                                .rounded_md()
-                                .bg(rgb(look::SURFACE))
-                                .text_color(rgb(look::TEXT_DIM))
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-                                .child(t!("cancel"))
-                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                        app.cancel_settings(cx);
-                                    });
-                                })
+                                .text_xs()
+                                .text_color(rgb(look::TEXT_FAINT))
+                                .child(message),
+                        )
+                        .when(self.editing.is_some(), |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child({
+                                        let weak = weak.clone();
+                                        div()
+                                            .id("commit-edit")
+                                            .px_3()
+                                            .py(px(5.0))
+                                            .rounded_md()
+                                            .bg(rgb(look::ACCENT))
+                                            .text_color(rgb(0x1a1205))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(t!("save"))
+                                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                                    app.commit_edit(cx);
+                                                });
+                                            })
+                                    })
+                                    .child({
+                                        let weak = weak.clone();
+                                        div()
+                                            .id("cancel-edit")
+                                            .px_3()
+                                            .py(px(5.0))
+                                            .rounded_md()
+                                            .bg(rgb(look::SURFACE))
+                                            .text_color(rgb(look::TEXT_DIM))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                                            .child(t!("cancel"))
+                                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                                    app.editing = None;
+                                                    cx.notify();
+                                                });
+                                            })
+                                    }),
+                            )
                         }),
                 )
                 .into_any_element()
@@ -887,17 +858,15 @@ mod gui {
     }
 
     impl Render for SwitchApp {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let pane = if self.view == View::Settings {
-                self.settings_pane(window, cx)
-            } else {
-                self.main_pane(cx)
-            };
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let pane = self.main_pane(cx);
             div()
+                .relative()
                 .size_full()
                 .bg(rgb(look::BG))
                 .text_color(rgb(look::TEXT))
                 .child(pane)
+                .when(self.lang_open, |d| d.child(self.language_overlay(cx)))
         }
     }
 
@@ -919,13 +888,6 @@ mod gui {
         /// The window itself, so raising it does not depend on the root entity
         /// type (`gpui_base::Root` once gpui-kit wraps the view).
         window: Option<gpui_kit::AnyWindowHandle>,
-    }
-
-    /// Which pane the window is showing.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum View {
-        Main,
-        Settings,
     }
 
     /// The languages this build ships.

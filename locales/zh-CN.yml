@@ -1,23 +1,14 @@
-refresh: 刷新
 working: 处理中...
 reading: 正在读取显示器状态...
 no_monitor: 未检测到 DDC 显示器
-switch: 切换
 unlisted: 未列出
-inputs_available: "共 %{count} 个输入"
 no_inputs: 显示器没有上报可切换的输入
 read_failed: "读取失败：%{error}"
 reverted: "显示器切回了原来的输入（目标端口没有信号）"
 switch_failed_short: "显示器没有接受这次切换"
 switch_failed: "切换失败：%{error}"
 switching_to: "正在切换到 %{code}..."
-saved: "端口标签已保存"
 
-settings: 设置
-back: 返回
-language: 语言
-port_labels: 端口标签
-port_labels_hint: 留空则使用显示器上报的名称。标签只对这台显示器生效。
 save: 保存
 cancel: 取消
 

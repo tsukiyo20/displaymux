@@ -227,14 +227,13 @@ mod gui {
     impl SwitchApp {
         fn new(cx: &mut Context<Self>) -> Self {
             let worker = Worker::spawn();
-            let _ = worker.tx.send(Request::Refresh);
             let settings = Settings::load();
             let settings_theme = settings.theme.clone();
             let app = SwitchApp {
                 worker,
                 status: None,
                 message: t!("reading").into(),
-                busy: true,
+                busy: false,
                 index: 0,
                 pending_input: None,
                 settings,
@@ -245,6 +244,21 @@ mod gui {
                 dark: true,
             };
             app.poll(cx);
+            // The first DDC transaction opens an I2C connection to the display.
+            // Starting one in the same breath as the window is the closest the
+            // app comes to disturbing the display link, and on a panel running
+            // HDR -- where the link has more to renegotiate -- that shows up as
+            // the screen's colours breaking for a moment at launch. Nothing in
+            // the window is waiting on this read, so it can wait for the link.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(700))
+                    .await;
+                let _ = this.update(cx, |app: &mut SwitchApp, cx| {
+                    app.send(Request::Refresh, t!("reading"), cx);
+                });
+            })
+            .detach();
             app
         }
 

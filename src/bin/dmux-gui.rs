@@ -244,15 +244,36 @@ mod gui {
                 dark: true,
             };
             app.poll(cx);
-            // The first DDC transaction opens an I2C connection to the display.
-            // Starting one in the same breath as the window is the closest the
-            // app comes to disturbing the display link, and on a panel running
-            // HDR -- where the link has more to renegotiate -- that shows up as
-            // the screen's colours breaking for a moment at launch. Nothing in
-            // the window is waiting on this read, so it can wait for the link.
+            // The first DDC transaction opens an I2C connection to the display,
+            // and starting one while the window is still setting up its display
+            // link is the closest this app comes to disturbing the panel -- on a
+            // link running HDR that showed up as the screen's colours breaking
+            // for a moment at launch. Nothing in the window waits on the read,
+            // so it waits for the window: frontmost first, then one more beat
+            // for the link. The timer covers a launch that opens behind
+            // something else, where active never arrives on its own.
             cx.spawn(async move |this, cx| {
+                let started = std::time::Instant::now();
+                while started.elapsed() < Duration::from_secs(2) {
+                    let frontmost = cx.update(|cx| {
+                        cx.global::<Installed>()
+                            .window
+                            .and_then(|handle| {
+                                handle
+                                    .update(cx, |_, window, _| window.is_window_active())
+                                    .ok()
+                            })
+                            .unwrap_or(false)
+                    });
+                    if frontmost {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(60))
+                        .await;
+                }
                 cx.background_executor()
-                    .timer(Duration::from_millis(700))
+                    .timer(Duration::from_millis(200))
                     .await;
                 let _ = this.update(cx, |app: &mut SwitchApp, cx| {
                     app.send(Request::Refresh, t!("reading"), cx);

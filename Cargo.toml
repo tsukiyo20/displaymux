@@ -56,6 +56,10 @@ tray-icon = "0.26"
 # polling on a timer. Not optional, for the same reason `tray-icon` is not:
 # the tray lives in the library, so the CLI build needs it too.
 async-channel = "2.5"
+# Translations. Same major as the one gpui-component vendors (4.2), so cargo
+# unifies them and one `set_locale` drives both our strings and the component
+# library's.
+rust-i18n = "4"
 
 [features]
 default = []

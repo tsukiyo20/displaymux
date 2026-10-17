@@ -18,7 +18,13 @@
 //!   monitors report a constant "current input" regardless of the truth, so the
 //!   UI reports intent rather than state ([`session`], [`state`]).
 
+// Loads `locales/*.yml` at compile time. The binary invokes this too, because
+// rust-i18n's `t!` only resolves in the crate that declared it.
+rust_i18n::i18n!("locales", fallback = "en");
+
+pub mod config;
 pub mod ddc;
 pub mod labels;
+pub mod settings;
 pub mod tray;
 pub mod vcp;

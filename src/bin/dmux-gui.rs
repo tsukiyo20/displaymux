@@ -52,6 +52,10 @@
 // print its explanation to. (Ignored on non-Windows targets.)
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
+// rust-i18n's `t!` only resolves in the crate that declared the loader, so
+// the binary needs its own declaration even though the library has one.
+rust_i18n::i18n!("locales", fallback = "en");
+
 #[cfg(not(feature = "gui"))]
 fn main() {
     eprintln!(
@@ -70,13 +74,17 @@ fn main() {
 #[cfg(feature = "gui")]
 mod gui {
     use displaymux::ddc::{self, Status};
+    use displaymux::labels::Labels;
+    use displaymux::settings::Settings;
     use displaymux::tray::{Tray, TrayEvent};
+    use gpui_kit::component::input::{Input, InputState};
     // `gpui_kit::*` is GPUI: the facade re-exports `gpui-pre` wholesale, so the
     // element and app types come from the same place as before.
     use gpui_kit::{
-        div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Global, IntoElement,
-        QuitMode, SharedString, WeakEntity, Window, WindowBounds, WindowOptions,
+        div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Entity, Global,
+        IntoElement, QuitMode, SharedString, WeakEntity, Window, WindowBounds, WindowOptions,
     };
+    use rust_i18n::t;
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -181,6 +189,11 @@ mod gui {
         index: usize,
         /// The target of an in-flight switch, remembered once it is accepted.
         pending_input: Option<String>,
+        view: View,
+        settings: Settings,
+        /// One text field per port while the settings pane is open. Built on
+        /// demand because `InputState` needs the window that renders it.
+        editors: Vec<(String, Entity<InputState>)>,
     }
 
     impl SwitchApp {
@@ -190,10 +203,13 @@ mod gui {
             let app = SwitchApp {
                 worker,
                 status: None,
-                message: "reading monitor state...".into(),
+                message: t!("reading").into(),
                 busy: true,
                 index: 0,
                 pending_input: None,
+                view: View::Main,
+                settings: Settings::load(),
+                editors: Vec::new(),
             };
             app.poll(cx);
             app
@@ -213,7 +229,7 @@ mod gui {
                 .status
                 .as_ref()
                 .map(|s| s.display_id.clone())
-                .unwrap_or_else(|| "no DDC monitor".to_string());
+                .unwrap_or_else(|| t!("no_monitor").to_string());
             let inputs: Vec<(String, String)> = self
                 .status
                 .as_ref()
@@ -234,7 +250,7 @@ mod gui {
         /// borrowing the view again.
         fn on_tray(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
             match event {
-                TrayEvent::Refresh => self.send(Request::Refresh, "reading monitor state...", cx),
+                TrayEvent::Refresh => self.send(Request::Refresh, t!("reading"), cx),
                 TrayEvent::Switch(code) => {
                     self.pending_input = Some(code.clone());
                     self.send(
@@ -242,7 +258,7 @@ mod gui {
                             index: self.index,
                             code: code.clone(),
                         },
-                        format!("switching to {}...", code),
+                        t!("switching_to", code = code.as_str()),
                         cx,
                     )
                 }
@@ -294,16 +310,18 @@ mod gui {
                         // follow the actual input; the honest state comes from
                         // the USB-based banner above.
                         self.message = if s.inputs.is_empty() {
-                            "monitor did not report any switchable inputs".into()
+                            t!("no_inputs").into()
                         } else {
-                            format!("{} inputs available", s.inputs.len()).into()
+                            t!("inputs_available", count = s.inputs.len()).into()
                         };
                         if !s.inputs.is_empty() {
                             self.index = s.display_index;
                         }
                         self.status = Some(s);
                     }
-                    Err(e) => self.message = format!("read failed: {}", e).into(),
+                    Err(e) => {
+                        self.message = t!("read_failed", error = e.to_string().as_str()).into()
+                    }
                 },
                 Response::Switched(r) => match *r {
                     Ok(verdict) => {
@@ -313,7 +331,9 @@ mod gui {
                         self.pending_input.take();
                         self.message = verdict.into();
                     }
-                    Err(e) => self.message = format!("switch failed: {}", e).into(),
+                    Err(e) => {
+                        self.message = t!("switch_failed", error = e.to_string().as_str()).into()
+                    }
                 },
             }
             self.sync_tray(cx);
@@ -363,13 +383,18 @@ mod gui {
                     .child(div().text_color(rgb(0x8ab4f8)).child(code.clone()))
                     .child(div().text_color(rgb(0xe6e6e6)).child(name))
                     .when(!advertised, |d| {
-                        d.child(div().text_color(rgb(0x8a8a90)).text_sm().child("unlisted"))
+                        d.child(
+                            div()
+                                .text_color(rgb(0x8a8a90))
+                                .text_sm()
+                                .child(t!("unlisted")),
+                        )
                     }),
             )
             .child(
                 div()
                     .text_color(rgb(0x8ab4f8))
-                    .child("switch")
+                    .child(t!("switch"))
                     .into_any_element(),
             )
             .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
@@ -380,20 +405,103 @@ mod gui {
                             index: app.index,
                             code: code.clone(),
                         },
-                        format!("switching to {}...", code),
+                        t!("switching_to", code = code.as_str()),
                         cx,
                     );
                 });
             })
     }
 
-    impl Render for SwitchApp {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    impl SwitchApp {
+        /// Enter the settings pane. The text fields are built during render,
+        /// because `InputState` needs the window that will host it.
+        fn open_settings(&mut self, cx: &mut Context<Self>) {
+            self.editors.clear();
+            self.view = View::Settings;
+            cx.notify();
+        }
+
+        fn cancel_settings(&mut self, cx: &mut Context<Self>) {
+            self.editors.clear();
+            self.view = View::Main;
+            cx.notify();
+        }
+
+        /// One text field per advertised port, seeded with the current label.
+        fn ensure_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if !self.editors.is_empty() {
+                return;
+            }
+            let inputs: Vec<(String, String)> = self
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.inputs
+                        .iter()
+                        .map(|i| (i.code.clone(), i.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (code, name) in inputs {
+                let editor = cx.new(|cx| InputState::new(window, cx).default_value(name));
+                self.editors.push((code, editor));
+            }
+        }
+
+        /// Write every field to labels.json and reload.
+        ///
+        /// An empty field removes the label rather than storing an empty one, so
+        /// the port falls back to the name the monitor reports.
+        fn save_labels(&mut self, cx: &mut Context<Self>) {
+            let Some(display) = self.status.as_ref().map(|s| s.display_id.clone()) else {
+                return;
+            };
+            let mut labels = Labels::load();
+            for (code, editor) in &self.editors {
+                let text = editor.read(cx).value().trim().to_string();
+                // A field that still holds the MCCS name is not a label: writing
+                // it would pin the name the monitor reports and stop it following
+                // the hardware. Only a real difference is worth persisting.
+                let mccs = u16::from_str_radix(code.trim_start_matches("0x"), 16)
+                    .map(displaymux::vcp::input_name)
+                    .unwrap_or_default();
+                if text.is_empty() || text == mccs {
+                    labels.clear(&display, code);
+                } else {
+                    labels.set(&display, code, &text);
+                }
+            }
+            match labels.save() {
+                Ok(_) => {
+                    self.editors.clear();
+                    self.view = View::Main;
+                    self.send(Request::Refresh, t!("reading"), cx);
+                    self.message = t!("saved").into();
+                }
+                Err(e) => {
+                    self.message = t!("read_failed", error = e.to_string().as_str()).into();
+                    cx.notify();
+                }
+            }
+        }
+
+        fn choose_language(&mut self, tag: &'static str, cx: &mut Context<Self>) {
+            // The locale is process-global, so this also changes the component
+            // library's own strings.
+            rust_i18n::set_locale(tag);
+            self.settings.locale = Some(tag.to_string());
+            let _ = self.settings.save();
+            // The menu bar was built with the previous language.
+            self.sync_tray(cx);
+            cx.notify();
+        }
+
+        fn main_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
             let title = self
                 .status
                 .as_ref()
                 .map(|s| s.display_id.clone())
-                .unwrap_or_else(|| "no DDC monitor".to_string());
+                .unwrap_or_else(|| t!("no_monitor").to_string());
             let busy = self.busy;
             let message = self.message.clone();
             let weak = cx.entity().downgrade();
@@ -416,10 +524,7 @@ mod gui {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .bg(rgb(0x1b1b20))
                 .size_full()
-                .p_3()
-                .text_color(rgb(0xe6e6e6))
                 .child(
                     div()
                         .flex()
@@ -429,25 +534,55 @@ mod gui {
                         .child(div().text_lg().child(title))
                         .child(
                             div()
-                                .id("refresh")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x2f2f38))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3d3d48)))
-                                .child(if busy { "working..." } else { "refresh" })
-                                .on_click({
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("refresh")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x2f2f38))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(0x3d3d48)))
+                                        .child(if busy {
+                                            t!("working")
+                                        } else {
+                                            t!("refresh")
+                                        })
+                                        .on_click({
+                                            let weak = weak.clone();
+                                            move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                                let _ = weak.update(
+                                                    cx,
+                                                    |app: &mut SwitchApp, cx| {
+                                                        app.send(
+                                                            Request::Refresh,
+                                                            t!("reading"),
+                                                            cx,
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        }),
+                                )
+                                .child({
                                     let weak = weak.clone();
-                                    move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                            app.send(
-                                                Request::Refresh,
-                                                "reading monitor state...",
-                                                cx,
-                                            );
-                                        });
-                                    }
+                                    div()
+                                        .id("settings")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x2f2f38))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(0x3d3d48)))
+                                        .child(t!("settings"))
+                                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                                app.open_settings(cx);
+                                            });
+                                        })
                                 }),
                         ),
                 )
@@ -459,6 +594,182 @@ mod gui {
                         .text_color(rgb(0x9a9aa2))
                         .child(message),
                 )
+                .into_any_element()
+        }
+
+        fn settings_pane(
+            &mut self,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> gpui_kit::AnyElement {
+            self.ensure_editors(window, cx);
+            let weak = cx.entity().downgrade();
+            let current = self.settings.locale.clone().unwrap_or_default();
+
+            let languages: Vec<gpui_kit::AnyElement> = LOCALES
+                .iter()
+                .map(|(tag, name)| {
+                    let tag = *tag;
+                    let selected = tag == current;
+                    let weak = weak.clone();
+                    div()
+                        .id(SharedString::from(format!("lang-{tag}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(if selected {
+                            rgb(0x2d4f7c)
+                        } else {
+                            rgb(0x2f2f38)
+                        })
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x3d3d48)))
+                        .child(*name)
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.choose_language(tag, cx);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+
+            let fields: Vec<gpui_kit::AnyElement> = self
+                .editors
+                .iter()
+                .map(|(code, editor)| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(56.0))
+                                .text_color(rgb(0x8ab4f8))
+                                .child(code.clone()),
+                        )
+                        .child(div().flex_1().child(Input::new(editor)))
+                        .into_any_element()
+                })
+                .collect();
+
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .size_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(div().text_lg().child(t!("settings")))
+                        .child({
+                            let weak = weak.clone();
+                            div()
+                                .id("back")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f2f38))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3d3d48)))
+                                .child(t!("back"))
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                        app.cancel_settings(cx);
+                                    });
+                                })
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(72.0))
+                                .text_sm()
+                                .text_color(rgb(0x9a9aa2))
+                                .child(t!("language")),
+                        )
+                        .children(languages),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x9a9aa2))
+                                .child(t!("port_labels")),
+                        )
+                        .children(fields),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8a8a90))
+                        .child(t!("port_labels_hint")),
+                )
+                .child(
+                    div()
+                        .mt_auto()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child({
+                            let weak = weak.clone();
+                            div()
+                                .id("save")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2d4f7c))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3a5f92)))
+                                .child(t!("save"))
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                        app.save_labels(cx);
+                                    });
+                                })
+                        })
+                        .child({
+                            let weak = weak.clone();
+                            div()
+                                .id("cancel")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f2f38))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3d3d48)))
+                                .child(t!("cancel"))
+                                .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                        app.cancel_settings(cx);
+                                    });
+                                })
+                        }),
+                )
+                .into_any_element()
+        }
+    }
+
+    impl Render for SwitchApp {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if self.view == View::Settings {
+                self.settings_pane(window, cx)
+            } else {
+                self.main_pane(cx)
+            }
         }
     }
 
@@ -481,6 +792,16 @@ mod gui {
         /// type (`gpui_base::Root` once gpui-kit wraps the view).
         window: Option<gpui_kit::AnyWindowHandle>,
     }
+
+    /// Which pane the window is showing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum View {
+        Main,
+        Settings,
+    }
+
+    /// The languages this build ships.
+    const LOCALES: &[(&str, &str)] = &[("en", "English"), ("zh-CN", "简体中文")];
 
     impl Global for Installed {}
 
@@ -583,6 +904,21 @@ mod gui {
             // Initialises the enabled gpui-kit layers (base, styled
             // components, assets). Must run before any window is opened.
             gpui_kit::init(cx);
+
+            // The component library ships a light theme by default; this window is
+            // dark throughout, so its inputs would otherwise render as white boxes.
+            gpui_kit::component::theme::Theme::change(
+                gpui_kit::component::theme::ThemeMode::Dark,
+                None,
+                cx,
+            );
+
+            // A saved language wins over the compile-time default. The locale is
+            // process-global, so this also switches the component library's own
+            // strings (dialog buttons, date pickers) in one call.
+            if let Some(tag) = displaymux::settings::Settings::load().locale {
+                rust_i18n::set_locale(&tag);
+            }
             // The status item has to be created here: on macOS it needs the main
             // thread with an event loop already running, which is exactly what
             // the `run` closure provides. It goes in before the window so that

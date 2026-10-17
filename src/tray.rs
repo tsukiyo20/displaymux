@@ -16,6 +16,7 @@
 
 use async_channel::Sender;
 
+use rust_i18n::t;
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -151,9 +152,9 @@ impl Tray {
         forward_events(events);
 
         let header = MenuItem::with_id(ID_HEADER, "dmux: reading monitor...", false, None);
-        let refresh = MenuItem::with_id(ID_REFRESH, "Refresh", true, None);
+        let refresh = MenuItem::with_id(ID_REFRESH, t!("tray_refresh"), true, None);
         let show = MenuItem::with_id(ID_SHOW, "Show window", true, None);
-        let quit = MenuItem::with_id(ID_QUIT, "Quit dmux", true, None);
+        let quit = MenuItem::with_id(ID_QUIT, t!("tray_quit"), true, None);
 
         let menu = Menu::new();
         if let Err(e) = menu.append_items(&[
@@ -211,7 +212,7 @@ impl Tray {
     /// README's "How it works"). The header names the display and nothing else.
     pub fn update(&mut self, display: &str, inputs: &[(String, String)]) {
         self.header.set_text(display);
-        self.show.set_text("Show window");
+        self.show.set_text(t!("tray_show"));
 
         // Rebuild the input rows only when the set of ports changed; keeping the
         // rows stable avoids flicker in the open menu.

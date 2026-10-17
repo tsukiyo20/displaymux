@@ -215,6 +215,21 @@ leaves the user reaching for the monitor's buttons. So the tool stays a
 switcher; the only thing it reports is the outcome of the command you just asked
 for.
 
+### Settings
+
+The window has a **Settings** pane, reached from the button beside *refresh*.
+It holds two things:
+
+* **Language.** English and 简体中文 ship today. The choice is written to
+  `settings.json` and applied to the whole process, so the component library's
+  own strings (dialogs, date pickers) switch with ours.
+* **Port labels.** One text field per advertised input. Leaving a field holding
+  the name the monitor reports means "no label" — only a real difference is
+  persisted, so a monitor that renames a port still shows through.
+
+Translations are plain YAML in [`locales/`](locales). Adding a language is one
+file plus an entry in the `LOCALES` table in `dmux-gui.rs`.
+
 ### Naming the ports
 
 Because DDC cannot name the socket, you can. Labels live next to the app's other

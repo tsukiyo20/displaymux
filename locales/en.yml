@@ -1,0 +1,25 @@
+# User-visible strings. Keep keys stable; the same keys live in every locale.
+refresh: refresh
+working: working...
+reading: reading monitor state...
+no_monitor: no DDC monitor
+switch: switch
+unlisted: unlisted
+inputs_available: "%{count} inputs available"
+no_inputs: monitor did not report any switchable inputs
+read_failed: "read failed: %{error}"
+switch_failed: "switch failed: %{error}"
+switching_to: "switching to %{code}..."
+saved: "Port labels saved"
+
+settings: settings
+back: back
+language: Language
+port_labels: Port labels
+port_labels_hint: "Leave a field empty to use the name the monitor reports. Labels apply to this display only."
+save: Save
+cancel: Cancel
+
+tray_refresh: Refresh
+tray_show: Show window
+tray_quit: Quit dmux

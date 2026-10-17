@@ -28,18 +28,9 @@ use std::path::PathBuf;
 /// Overrides the file location. Used by the tests, and by a portable install.
 const ENV: &str = "DMUX_LABELS";
 
-/// Where the label file lives, following each platform's config convention.
+/// Where the label file lives.
 pub fn labels_path() -> Option<PathBuf> {
-    let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from(std::env::var("HOME").ok()?).join("Library/Application Support")
-    } else if cfg!(target_os = "windows") {
-        PathBuf::from(std::env::var("APPDATA").ok()?)
-    } else {
-        PathBuf::from(std::env::var("HOME").ok()?).join(".config")
-    };
-    Some(base.join("displaymux").join("labels.json"))
+    Some(crate::config::dir()?.join("labels.json"))
 }
 
 fn resolved_path() -> Option<PathBuf> {
@@ -106,6 +97,16 @@ impl Labels {
             .entry(display.to_string())
             .or_default()
             .insert(normalize(code), label.to_string());
+    }
+
+    /// Drop one label, so the port falls back to the monitor's own name.
+    pub fn clear(&mut self, display: &str, code: &str) {
+        if let Some(entries) = self.0.get_mut(display) {
+            entries.remove(&normalize(code));
+            if entries.is_empty() {
+                self.0.remove(display);
+            }
+        }
     }
 
     /// Write the file, creating its directory. Returns where it was written.

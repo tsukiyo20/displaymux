@@ -1445,6 +1445,7 @@ dependencies = [
  "async-channel",
  "ddc-hi",
  "gpui-kit",
+ "rust-i18n",
  "serde",
  "serde_json",
  "tray-icon",

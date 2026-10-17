@@ -582,7 +582,6 @@ impl Reader {
             }
         }
         let mut st = Status::from_json(&v);
-        st.apply_labels(&crate::labels::Labels::load());
         // The reader reports an empty advertised set when it skipped caps; fill
         // from cache so the UI always has the real port list.
         if st.inputs.iter().all(|i| !i.advertised) {
@@ -603,6 +602,9 @@ impl Reader {
                     .collect();
             }
         }
+        // Applied last: rebuilding the list above used the MCCS names, which
+        // would otherwise overwrite the user's labels on every read.
+        st.apply_labels(&crate::labels::Labels::load());
         Ok(st)
     }
 }

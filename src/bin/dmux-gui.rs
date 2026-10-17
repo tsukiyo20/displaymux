@@ -217,11 +217,6 @@ mod gui {
         editing: Option<(String, Entity<InputState>)>,
         /// Whether the language list is showing.
         lang_open: bool,
-        /// The port awaiting confirmation, and the seconds left on it.
-        confirm: Option<String>,
-        confirm_left: u8,
-        /// Bumped by every arm or cancel so a stale countdown stops ticking.
-        confirm_gen: u64,
     }
 
     impl SwitchApp {
@@ -238,9 +233,6 @@ mod gui {
                 settings: Settings::load(),
                 editing: None,
                 lang_open: false,
-                confirm: None,
-                confirm_left: CONFIRM_SECONDS,
-                confirm_gen: 0,
             };
             app.poll(cx);
             app
@@ -429,119 +421,72 @@ mod gui {
         code: String,
         name: String,
         advertised: bool,
-        confirm_left: Option<u8>,
         weak: WeakEntity<SwitchApp>,
     ) -> gpui_kit::AnyElement {
-        let trailing = match confirm_left {
-            // Confirming: the countdown is the button, and cancelling is next
-            // to it, so the whole decision stays under one finger.
-            Some(left) => div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child({
-                    let weak = weak.clone();
-                    div()
-                        .id(SharedString::from(format!("cancel-{}", code)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(24.0))
-                        .rounded_md()
-                        .bg(rgb(look::SURFACE_ACTIVE))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x3c3c4a)))
-                        .child(
-                            Icon::new(IconName::Close)
-                                .text_color(rgb(look::TEXT_DIM))
-                                .text_sm(),
-                        )
-                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.cancel_confirm(cx);
-                            });
-                        })
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(24.0))
-                        .w(px(30.0))
-                        .rounded_md()
-                        .bg(rgb(look::ACCENT))
-                        .text_xs()
-                        .text_color(rgb(look::ON_ACCENT))
-                        .child(format!("{}", left)),
-                )
-                .into_any_element(),
-            None => div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child({
-                    let weak = weak.clone();
-                    let code = code.clone();
-                    div()
-                        .id(SharedString::from(format!("edit-{}", code)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(24.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
-                        .child(
-                            Icon::default()
-                                .data(PENCIL_SVG)
-                                .text_color(rgb(look::TEXT_FAINT))
-                                .text_sm(),
-                        )
-                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            let code = code.clone();
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.open_edit_dialog(code, window, cx);
-                            });
-                        })
-                })
-                .child({
-                    let weak = weak.clone();
-                    let code = code.clone();
-                    div()
-                        .id(SharedString::from(format!("switch-{}", code)))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .h(px(24.0))
-                        .px_2()
-                        .rounded_md()
-                        .bg(rgb(look::SURFACE_ACTIVE))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x3c3c4a)))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(look::TEXT_DIM))
-                                .child(t!("switch")),
-                        )
-                        .child(
-                            Icon::new(IconName::ChevronRight)
-                                .text_color(rgb(look::TEXT_FAINT))
-                                .text_xs(),
-                        )
-                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                            let code = code.clone();
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.start_confirm(code, cx);
-                            });
-                        })
-                })
-                .into_any_element(),
-        };
+        let trailing = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child({
+                let weak = weak.clone();
+                let code = code.clone();
+                div()
+                    .id(SharedString::from(format!("edit-{}", code)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(24.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                    .child(
+                        Icon::default()
+                            .data(PENCIL_SVG)
+                            .text_color(rgb(look::TEXT_FAINT))
+                            .text_sm(),
+                    )
+                    .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let code = code.clone();
+                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                            app.open_edit_dialog(code, window, cx);
+                        });
+                    })
+            })
+            .child({
+                let weak = weak.clone();
+                let code = code.clone();
+                div()
+                    .id(SharedString::from(format!("switch-{}", code)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h(px(24.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(rgb(look::SURFACE_ACTIVE))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3c3c4a)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(look::TEXT_DIM))
+                            .child(t!("switch")),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .text_color(rgb(look::TEXT_FAINT))
+                            .text_xs(),
+                    )
+                    .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let code = code.clone();
+                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                            app.open_confirm_dialog(code, window, cx);
+                        });
+                    })
+            })
+            .into_any_element();
 
         div()
             .id(SharedString::from(format!("input-{}", code)))
@@ -580,57 +525,182 @@ mod gui {
             .into_any_element()
     }
 
-    impl SwitchApp {
-        /// Arm a switch. It fires when the countdown runs out; the point of the
-        /// delay is that switching is not reversible from this side.
-        fn start_confirm(&mut self, code: String, cx: &mut Context<Self>) {
-            self.confirm_gen += 1;
-            let generation = self.confirm_gen;
-            self.confirm = Some(code.clone());
-            self.confirm_left = CONFIRM_SECONDS;
-            cx.notify();
+    /// The confirm dialog's footer.
+    ///
+    /// Its own view because the countdown changes every second and a dialog
+    /// footer is a static element: only an entity re-renders. It also owns the
+    /// auto-fire, so "OK" and "ran out" take exactly the same path.
+    struct ConfirmFooter {
+        left: u8,
+        code: String,
+        app: WeakEntity<SwitchApp>,
+        window: Option<gpui_kit::AnyWindowHandle>,
+    }
 
+    impl ConfirmFooter {
+        fn new(
+            code: String,
+            app: WeakEntity<SwitchApp>,
+            window: Option<gpui_kit::AnyWindowHandle>,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            // Ticking stops on its own: closing the dialog drops this entity,
+            // and the weak upgrade below then fails.
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let fire = this.update(cx, |app, cx| {
-                        // A cancel or a newer request invalidates this countdown.
-                        if app.confirm_gen != generation
-                            || app.confirm.as_deref() != Some(code.as_str())
-                        {
+                    let fire = this.update(cx, |footer, cx| {
+                        if footer.left == 0 {
                             return false;
                         }
-                        app.confirm_left = app.confirm_left.saturating_sub(1);
+                        footer.left -= 1;
                         cx.notify();
-                        app.confirm_left == 0
+                        footer.left == 0
                     });
                     match fire {
-                        Ok(true) => {
-                            let _ = this.update(cx, |app, cx| {
-                                app.confirm = None;
-                                app.send(
-                                    Request::Switch {
-                                        index: app.index,
-                                        code: code.clone(),
-                                    },
-                                    t!("switching_to", code = code.as_str()),
-                                    cx,
-                                );
-                            });
-                            break;
-                        }
+                        Ok(true) => break,
                         Ok(false) => continue,
-                        Err(_) => break,
+                        Err(_) => return,
                     }
                 }
+                let _ = this.update(cx, |footer, cx| {
+                    let code = footer.code.clone();
+                    let app = footer.app.clone();
+                    let window = footer.window;
+                    let _ = app.update(cx, |app: &mut SwitchApp, cx| app.fire_switch(code, cx));
+                    if let Some(window) = window {
+                        let _ = window.update(cx, |_, window, cx| window.close_dialog(cx));
+                    }
+                });
             })
             .detach();
+
+            Self {
+                left: CONFIRM_SECONDS,
+                code,
+                app,
+                window,
+            }
+        }
+    }
+
+    impl Render for ConfirmFooter {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let left = self.left;
+            let code = self.code.clone();
+            let app = self.app.clone();
+            let cancel_app = self.app.clone();
+
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap_2()
+                .w_full()
+                .child(
+                    div()
+                        .id("confirm-cancel")
+                        .px_3()
+                        .py(px(5.0))
+                        .rounded_md()
+                        .bg(rgb(look::SURFACE_ACTIVE))
+                        .text_color(rgb(look::TEXT_DIM))
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x3c3c4a)))
+                        .child(t!("cancel"))
+                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let _ = cancel_app.update(cx, |app: &mut SwitchApp, cx| {
+                                app.message = String::new().into();
+                                cx.notify();
+                            });
+                            window.close_dialog(cx);
+                        }),
+                )
+                .child({
+                    let app = app.clone();
+                    div()
+                        .id("confirm-ok")
+                        .px_3()
+                        .py(px(5.0))
+                        .rounded_md()
+                        .bg(rgb(look::ACCENT))
+                        .text_color(rgb(look::ON_ACCENT))
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .child(t!("confirm_switch", count = left))
+                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let code = code.clone();
+                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
+                                app.fire_switch(code, cx);
+                            });
+                            window.close_dialog(cx);
+                        })
+                })
+        }
+    }
+
+    impl SwitchApp {
+        /// Ask before switching.
+        ///
+        /// The Switch button in the dialog counts down and fires itself; the
+        /// countdown lives in the footer entity rather than here, because a
+        /// dialog footer is built once and a plain element would show "3"
+        /// forever.
+        fn open_confirm_dialog(
+            &mut self,
+            code: String,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let name = self
+                .status
+                .as_ref()
+                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
+                .map(|i| format!("{} ({})", i.name, i.code))
+                .unwrap_or_else(|| code.clone());
+            let app = cx.entity().downgrade();
+            let window_handle = cx.active_window();
+            let footer = cx.new(|cx| ConfirmFooter::new(code, app, window_handle, cx));
+            window.open_dialog(cx, move |dialog, _window, _cx| {
+                let footer = footer.clone();
+                let name = name.clone();
+                dialog
+                    .title(t!("confirm_title").to_string())
+                    .content(move |content, _window, _cx| {
+                        let name = name.clone();
+                        content
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(look::TEXT))
+                                    .child(t!("confirm_body", name = name.as_str()).to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(look::TEXT_FAINT))
+                                    .child(t!("confirm_note").to_string()),
+                            )
+                    })
+                    .footer(footer)
+            });
         }
 
-        fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
-            self.confirm_gen += 1;
-            self.confirm = None;
-            cx.notify();
+        /// Send the switch the dialog was opened for.
+        fn fire_switch(&mut self, code: String, cx: &mut Context<Self>) {
+            self.send(
+                Request::Switch {
+                    index: self.index,
+                    code: code.clone(),
+                },
+                t!("switching_to", code = code.as_str()),
+                cx,
+            );
         }
 
         /// Edit one port's label in a dialog.
@@ -872,9 +942,6 @@ mod gui {
                 .as_ref()
                 .map(|s| s.display_id.clone())
                 .unwrap_or_else(|| t!("no_monitor").to_string());
-            let confirm = self.confirm.clone();
-            let confirm_left = self.confirm_left;
-
             let rows: Vec<gpui_kit::AnyElement> = self
                 .status
                 .as_ref()
@@ -882,18 +949,7 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
-                            let left = if confirm.as_deref() == Some(i.code.as_str()) {
-                                Some(confirm_left)
-                            } else {
-                                None
-                            };
-                            input_row(
-                                i.code.clone(),
-                                i.name.clone(),
-                                i.advertised,
-                                left,
-                                weak.clone(),
-                            )
+                            input_row(i.code.clone(), i.name.clone(), i.advertised, weak.clone())
                         })
                         .collect()
                 })

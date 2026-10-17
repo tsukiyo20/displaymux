@@ -9,6 +9,10 @@ switch_failed_short: "显示器没有接受这次切换"
 switch_failed: "切换失败：%{error}"
 switching_to: "正在切换到 %{code}..."
 
+confirm_title: "切换输入源"
+confirm_body: "把这块显示器切换到 %{name}？"
+confirm_note: "画面，以及接在显示器 hub 上的设备，都会转到那台电脑。"
+confirm_switch: "切换（%{count}）"
 edit_label: "端口标签"
 switch: 切换
 save: 保存

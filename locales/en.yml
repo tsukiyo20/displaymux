@@ -10,6 +10,10 @@ switch_failed_short: "the monitor did not accept the switch"
 switch_failed: "switch failed: %{error}"
 switching_to: "switching to %{code}..."
 
+confirm_title: "Switch input"
+confirm_body: "Switch this display to %{name}?"
+confirm_note: "The screen, and anything plugged into the monitor's hub, moves to that computer."
+confirm_switch: "Switch (%{count})"
 edit_label: "Port label"
 switch: Switch
 save: Save

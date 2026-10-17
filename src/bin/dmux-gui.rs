@@ -1117,6 +1117,12 @@ mod gui {
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(16.0), px(20.0))),
                 }),
+                // A fixed-size panel. It also removes the macOS zoom gesture,
+                // which a quick second click in the title-bar strip -- where the
+                // language chips sit -- would otherwise trigger: the window
+                // would jump to the full screen instead of changing language.
+                is_resizable: false,
+                is_minimizable: true,
                 ..Default::default()
             },
             cx,

@@ -9,16 +9,21 @@
 //!
 //! ## What this UI refuses to claim
 //!
-//! Switching a monitor's input is **not reversible from this side**. When the
-//! display moves to another machine, this host loses the video path — and on a
-//! desk where the keyboard and mouse hang off the monitor's USB hub, it loses
-//! its input devices too. There is no hotkey that could bring the display back.
+//! It is a switcher and nothing else. Every row is an action; none of them says
+//! which input the display is on now.
 //!
-//! For the same reason the UI never states which input the display is on. Some
-//! monitors report a constant VCP 0x60 regardless of the selected input, so the
-//! readback is not evidence; the only trustworthy "is it showing us?" signal is
-//! [`displaymux::session`], and rows are labelled "last sent here" because that
-//! is a record of our own command rather than a reading of the hardware.
+//! That is a deliberate refusal rather than an omission. There is no portable
+//! way to read a monitor's selected input back: VCP 0x60 is the code that
+//! should report it, but implementations vary — some answer with the byte
+//! duplicated, some do not answer reads at all, and whether a monitor answers
+//! while it is displaying another machine is not defined by the spec. Reporting
+//! a value we cannot stand behind would be worse than reporting nothing, and a
+//! wrong "you are here" invites a switch that strands the user.
+//!
+//! There is also no hotkey to fall back on. When the display moves, this host
+//! loses the video path, and on a desk where the keyboard and mouse hang off the
+//! monitor's USB hub it loses those too, so recovery means the monitor's own
+//! buttons.
 //!
 //! ## Threading model
 //!
@@ -65,8 +70,6 @@ fn main() {
 #[cfg(feature = "gui")]
 mod gui {
     use displaymux::ddc::{self, Status};
-    use displaymux::session::{self, Session};
-    use displaymux::state::State;
     use displaymux::tray::{Tray, TrayEvent};
     use gpui::{
         div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Global, IntoElement,
@@ -80,9 +83,6 @@ mod gui {
     const POLL_INTERVAL: Duration = Duration::from_millis(60);
     /// Tray clicks are checked on a timer; the menu bar is a secondary surface
     /// so a leisurely poll is fine and keeps everything on the GPUI thread.
-    /// How often the USB tree is inspected for the "on screen?" signal. Cheap
-    /// enough at this rate, and a switch takes about this long to settle anyway.
-    const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
     #[derive(Debug)]
     enum Request {
@@ -177,16 +177,6 @@ mod gui {
         message: SharedString,
         busy: bool,
         index: usize,
-        /// Persisted "where is this host plugged in" knowledge. Authoritative
-        /// over the monitor's readback, which is unreliable on some monitors
-        /// (see `displaymux::state`).
-        state: State,
-        /// The input we last switched to. Used only to mark a row as "you sent
-        /// the display here"; it is *not* a claim about the monitor's state.
-        current: Option<String>,
-        /// Whether the monitor is routed to this host, measured from USB device
-        /// presence rather than asked of the monitor. See `displaymux::session`.
-        session: Session,
         /// The target of an in-flight switch, remembered once it is accepted.
         pending_input: Option<String>,
     }
@@ -201,40 +191,10 @@ mod gui {
                 message: "reading monitor state...".into(),
                 busy: true,
                 index: 0,
-                state: State::load(),
-                current: None,
-                session: session::current(),
                 pending_input: None,
             };
             app.poll(cx);
-            app.poll_session(cx);
             app
-        }
-
-        /// Re-read the USB-based "is this host on screen?" signal on a timer.
-        ///
-        /// This is the honest replacement for asking the monitor which input it
-        /// is on: the keyboard and mouse sit behind the monitor's hub, so their
-        /// presence is evidence, not a claim.
-        fn poll_session(&self, cx: &mut Context<Self>) {
-            cx.spawn(async move |this, cx| loop {
-                cx.background_executor().timer(SESSION_POLL_INTERVAL).await;
-                let now = session::current();
-                let changed = this
-                    .update(cx, |app, _| {
-                        let changed = app.session != now;
-                        app.session = now;
-                        changed
-                    })
-                    .unwrap_or(false);
-                if changed {
-                    let _ = this.update(cx, |app, cx| {
-                        app.sync_tray(cx);
-                        cx.notify();
-                    });
-                }
-            })
-            .detach();
         }
 
         /// Push current state into the menu bar menu.
@@ -252,41 +212,17 @@ mod gui {
                 .as_ref()
                 .map(|s| s.display_id.clone())
                 .unwrap_or_else(|| "no DDC monitor".to_string());
-            let current = self.current.clone().map(|code| {
-                let name = self
-                    .status
-                    .as_ref()
-                    .and_then(|s| {
-                        s.inputs
-                            .iter()
-                            .find(|i| i.code.eq_ignore_ascii_case(&code))
-                            .map(|i| i.name.clone())
-                    })
-                    .unwrap_or_else(|| code.clone());
-                (code, name)
-            });
-            let inputs: Vec<(String, String, bool)> = self
+            let inputs: Vec<(String, String)> = self
                 .status
                 .as_ref()
                 .map(|s| {
                     s.inputs
                         .iter()
-                        .map(|i| {
-                            let is_current = self
-                                .current
-                                .as_deref()
-                                .map(|c| c.eq_ignore_ascii_case(&i.code))
-                                .unwrap_or(i.current);
-                            (i.code.clone(), i.name.clone(), is_current)
-                        })
+                        .map(|i| (i.code.clone(), i.name.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
-            tray.update(
-                &display,
-                current.as_ref().map(|(c, n)| (c.as_str(), n.as_str())),
-                &inputs,
-            );
+            tray.update(&display, &inputs);
         }
 
         /// Act on the tray clicks that need this view.
@@ -363,48 +299,17 @@ mod gui {
                         if !s.inputs.is_empty() {
                             self.index = s.display_index;
                         }
-                        // Deliberately *not* taking the monitor's VCP 0x60 as
-                        // "where we are": on the reference monitor it reports a
-                        // constant value regardless of the actual input.
-                        let remembered =
-                            self.state.last_input(&s.display_id).map(|c| c.to_string());
-                        self.current = remembered;
                         self.status = Some(s);
                     }
                     Err(e) => self.message = format!("read failed: {}", e).into(),
                 },
                 Response::Switched(r) => match *r {
                     Ok(verdict) => {
-                        // The write was accepted. That is all we can honestly
-                        // claim: whether the monitor acted on it is not knowable
-                        // from here, and once it does act, this host loses the
-                        // display entirely.
-                        if let (Some(code), Some(id)) = (
-                            self.pending_input.take(),
-                            self.status.as_ref().map(|s| s.display_id.clone()),
-                        ) {
-                            let mut text = verdict;
-                            if let Some(back) =
-                                self.status.as_ref().and_then(|s| s.current_input.clone())
-                            {
-                                if !back.eq_ignore_ascii_case(&code) {
-                                    // A write that does not move the reported
-                                    // value is the signature of a monitor whose
-                                    // VCP 0x60 does not follow the input, so say
-                                    // so instead of implying it lied about ours.
-                                    text = format!(
-                                        "command sent for {} (monitor still reports {} for VCP 0x60)",
-                                        code, back
-                                    );
-                                }
-                            }
-                            self.state.remember_input(&id, &code);
-                            self.state.save();
-                            self.current = Some(code);
-                            self.message = text.into();
-                        } else {
-                            self.message = verdict.into();
-                        }
+                        // The write was accepted, which is all that can honestly
+                        // be claimed from here: the monitor may act on it, and
+                        // once it does this host loses the display entirely.
+                        self.pending_input.take();
+                        self.message = verdict.into();
                     }
                     Err(e) => self.message = format!("switch failed: {}", e).into(),
                 },
@@ -424,18 +329,15 @@ mod gui {
         }
     }
 
+    /// One switchable input. Deliberately carries no state: the row is an
+    /// action, not a reading.
     fn input_row(
         code: String,
         name: String,
-        current: bool,
         advertised: bool,
         app: gpui::WeakEntity<SwitchApp>,
     ) -> impl IntoElement {
-        let row_bg = if current {
-            rgb(0x2d4f7c)
-        } else {
-            rgb(0x26262e)
-        };
+        let row_bg = rgb(0x26262e);
         let code_for_click = code.clone();
         div()
             .id(SharedString::from(format!("input-{}", code)))
@@ -462,17 +364,12 @@ mod gui {
                         d.child(div().text_color(rgb(0x8a8a90)).text_sm().child("unlisted"))
                     }),
             )
-            .child(if current {
-                div()
-                    .text_color(rgb(0xa8a8b0))
-                    .child("last sent here")
-                    .into_any_element()
-            } else {
+            .child(
                 div()
                     .text_color(rgb(0x8ab4f8))
                     .child("switch")
-                    .into_any_element()
-            })
+                    .into_any_element(),
+            )
             .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
                 let code = code_for_click.clone();
                 let _ = app.update(cx, |app: &mut SwitchApp, cx| {
@@ -498,9 +395,7 @@ mod gui {
             let busy = self.busy;
             let message = self.message.clone();
             let weak = cx.entity().downgrade();
-            let session = self.session;
 
-            let current = self.current.clone();
             let rows: Vec<gpui::AnyElement> = self
                 .status
                 .as_ref()
@@ -508,18 +403,8 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
-                            let is_current = current
-                                .as_deref()
-                                .map(|c| c.eq_ignore_ascii_case(&i.code))
-                                .unwrap_or(i.current);
-                            input_row(
-                                i.code.clone(),
-                                i.name.clone(),
-                                is_current,
-                                i.advertised,
-                                weak.clone(),
-                            )
-                            .into_any_element()
+                            input_row(i.code.clone(), i.name.clone(), i.advertised, weak.clone())
+                                .into_any_element()
                         })
                         .collect()
                 })
@@ -563,26 +448,6 @@ mod gui {
                                     }
                                 }),
                         ),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(match session {
-                            Session::Visible => rgb(0x8fdf8f),
-                            Session::SwitchedAway => rgb(0xe0a060),
-                            Session::Unknown => rgb(0x8a8a90),
-                        })
-                        .child(match session {
-                            Session::Visible => {
-                                "This display is showing this computer (keyboard and mouse present)"
-                            }
-                            Session::SwitchedAway => {
-                                "This display has switched away - the only way back is the monitor's own input menu"
-                            }
-                            Session::Unknown => {
-                                "Display state unknown (peripherals are not behind the monitor)"
-                            }
-                        }),
                 )
                 .child(div().flex().flex_col().gap_1().children(rows))
                 .child(

@@ -13,7 +13,7 @@ from a menu — or script it.
 DELL U2720Q
 ────────────────────────────────
 0x0f  DisplayPort 1          switch
-0x10  DisplayPort 2   last sent here
+0x10  DisplayPort 2          switch
 0x11  HDMI 1                 switch
 0x12  HDMI 2                 switch
 ────────────────────────────────
@@ -185,19 +185,26 @@ example while the other machine is shutting down.
 Running `dmux-gui` installs a menu bar item. Closing its window does not quit the
 app: the menu is the primary interface, and `Quit dmux` is how you leave.
 
-The rows are the inputs the monitor advertises. A row marked `last sent here`
-records a command this app issued; it is not a reading of the monitor.
+The rows are the inputs the monitor advertises, and each one is an action. The
+app never says which input the display is on now.
 
-Devices attached behind the monitor's USB hub are used to tell whether the
-display is currently routed to this machine. That wiring is desk-specific, so it
-is opt-in:
+That is deliberate. There is no portable way to read a monitor's selected input
+back:
 
-```bash
-export DMUX_DEVICE_HINTS="<substring>,<substring>"   # devices behind the monitor hub
-export DMUX_HUB_HINT="<substring>"                   # the monitor's hub itself
-```
+* VCP `0x60` is the code that should report it, but implementations vary. Some
+  monitors answer with the byte duplicated (`0x0f0f` for `0x0f`), some do not
+  answer reads at all, and what a monitor does when asked from a *different*
+  input than the one it is displaying is not defined by the DDC/CI spec.
+* The value that does come back names the port in MCCS terms, which do not
+  describe the physical connector. A monitor whose USB-C port carries
+  DisplayPort alt-mode usually reports it as one of the DisplayPort values, so
+  a row labelled "DisplayPort 2" may well be the socket labelled Type-C. There
+  is no way to tell from DDC which is which.
 
-Without them the app reports the display state as unknown rather than guessing.
+A wrong "you are here" is worse than no answer, because it invites a switch that
+leaves the user reaching for the monitor's buttons. So the tool stays a
+switcher; the only thing it reports is the outcome of the command you just asked
+for.
 
 ## How it works
 
@@ -213,8 +220,6 @@ dmux    ──┘        │
 |---|---|
 | `vcp` | MCCS value naming, capabilities parsing, input specifier resolution |
 | `ddc` | Subprocess management, timeouts, retries, and the switch verdict |
-| `session` | Whether the display is routed here, from USB device presence |
-| `state` | The input this app last sent, persisted per display |
 | `tray` | Menu bar item and menu |
 
 `dmux-ddc-helper` performs exactly one DDC operation per invocation and exits.

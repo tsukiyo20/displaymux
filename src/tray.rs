@@ -16,7 +16,7 @@
 
 use async_channel::Sender;
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// A click on one of our menu rows.
@@ -137,7 +137,7 @@ pub struct Tray {
     header: MenuItem,
     show: MenuItem,
     /// Input rows, rebuilt whenever the advertised list changes.
-    rows: Vec<(String, CheckMenuItem)>,
+    rows: Vec<(String, MenuItem)>,
     menu: Menu,
 }
 
@@ -201,25 +201,16 @@ impl Tray {
     ///
     /// `inputs` is `(code, name, is_current)`; `current` is the raw current
     /// input code, which is what "reclaim" re-asserts.
-    pub fn update(
-        &mut self,
-        display: &str,
-        current: Option<(&str, &str)>,
-        inputs: &[(String, String, bool)],
-    ) {
-        match current {
-            // The header states what we last asked for, never what the monitor
-            // claims: on the reference monitor VCP 0x60 does not follow the
-            // actual input, and a wrong "you are here" is worse than none.
-            Some((code, name)) => {
-                self.header
-                    .set_text(format!("{display} - last sent: {code} {name}"));
-            }
-            None => {
-                self.header
-                    .set_text(format!("{display} - no input sent yet"));
-            }
-        }
+    /// Rewrite the menu to match the current monitor.
+    ///
+    /// `inputs` is `(code, name)`; `current` is `(code, name)` of the input
+    /// that was just asked for, if any.
+    ///
+    /// Rows are actions, not readings: nothing here says which input the
+    /// monitor is actually on, because that cannot be known reliably (see the
+    /// README's "How it works"). The header names the display and nothing else.
+    pub fn update(&mut self, display: &str, inputs: &[(String, String)]) {
+        self.header.set_text(display);
         self.show.set_text("Show window");
 
         // Rebuild the input rows only when the set of ports changed; keeping the
@@ -229,19 +220,13 @@ impl Tray {
                 .rows
                 .iter()
                 .zip(inputs)
-                .all(|((code, _), (want, _, _))| code == want);
+                .all(|((code, _), (want, _))| code == want);
         if !same {
             for (_, row) in self.rows.drain(..) {
                 let _ = self.menu.remove(&row);
             }
-            for (code, name, _) in inputs {
-                let row = CheckMenuItem::with_id(
-                    format!("{ID_SWITCH_PREFIX}{code}"),
-                    name.clone(),
-                    true,
-                    false,
-                    None,
-                );
+            for (code, name) in inputs {
+                let row = MenuItem::with_id(format!("{ID_SWITCH_PREFIX}{code}"), name, true, None);
                 // The trailing block is [separator, show, quit]; put the port
                 // rows above it.
                 let at = self.menu.items().len().saturating_sub(3);
@@ -251,11 +236,12 @@ impl Tray {
                 }
                 self.rows.push((code.clone(), row));
             }
+            return;
         }
 
-        for (code, row) in &self.rows {
-            let is_current = inputs.iter().any(|(c, _, cur)| c == code && *cur);
-            row.set_checked(is_current);
+        // Same ports, so only the labels can have moved.
+        for ((_, row), (_, name)) in self.rows.iter().zip(inputs) {
+            row.set_text(name);
         }
     }
 }

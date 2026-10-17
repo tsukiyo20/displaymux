@@ -92,10 +92,13 @@ fn cmd_status(args: &[String]) -> Result<(), DdcError> {
         )?
     };
     println!("display   : [{}] {}", st.display_index, st.display_id);
+    // What the monitor answers, not what it is doing: VCP 0x60 is the code that
+    // should report the selected input, and its reliability varies by monitor.
+    // Naming the source of the value keeps `status` a diagnostic.
     match (&st.current_input, &st.current_input_name) {
-        (Some(c), Some(n)) => println!("input     : {} ({})", c, n),
+        (Some(c), Some(n)) => println!("reported  : {} ({})  [VCP 0x60]", c, n),
         _ => println!(
-            "input     : unknown{}",
+            "reported  : unknown  [VCP 0x60]{}",
             st.read_error
                 .as_ref()
                 .map(|e| format!("  [{}]", e))

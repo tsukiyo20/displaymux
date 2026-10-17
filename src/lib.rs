@@ -19,7 +19,5 @@
 //!   UI reports intent rather than state ([`session`], [`state`]).
 
 pub mod ddc;
-pub mod session;
-pub mod state;
 pub mod tray;
 pub mod vcp;

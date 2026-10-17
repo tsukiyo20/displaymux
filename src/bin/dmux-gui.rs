@@ -84,7 +84,7 @@ mod gui {
     use gpui_kit::{
         div, point, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Entity, Global,
         IntoElement, QuitMode, SharedString, TitlebarOptions, WeakEntity, Window, WindowAppearance,
-        WindowBounds, WindowOptions,
+        WindowBounds, WindowDecorations, WindowOptions,
     };
     use rust_i18n::t;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -284,16 +284,13 @@ mod gui {
         fn on_tray(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
             match event {
                 TrayEvent::Refresh => self.send(Request::Refresh, t!("reading"), cx),
+                // The menu bar is a second entrance to the same irreversible
+                // command, so it gets the same confirmation rather than firing
+                // straight from a menu click.
                 TrayEvent::Switch(code) => {
-                    self.pending_input = Some(code.clone());
-                    self.send(
-                        Request::Switch {
-                            index: self.index,
-                            code: code.clone(),
-                        },
-                        t!("switching_to", code = code.as_str()),
-                        cx,
-                    )
+                    let p = self.palette();
+                    let name = self.input_name(&code);
+                    open_confirm(cx, p, code, name);
                 }
                 TrayEvent::Show | TrayEvent::Quit => {}
             }
@@ -410,29 +407,38 @@ mod gui {
         on_accent: u32,
     }
 
+    // Both sets are the Tailwind **neutral** scale, which is the one
+    // gpui-component's own themes use (and the one shadcn/ui is built on). The
+    // point is not the scale itself but sharing it: dialogs and text fields come
+    // from that library, and a window tinted a different grey family makes them
+    // look pasted on. Checks against gpui-component's `default-theme.json`:
+    //   dark  background neutral-950, foreground neutral-50, border neutral-800
+    //   light background white,       foreground neutral-950, border neutral-200
     const DARK: Palette = Palette {
-        bg: 0x141419,
-        surface: 0x1d1d24,
-        surface_hover: 0x282832,
-        surface_active: 0x32323e,
-        hairline: 0x26262f,
-        text: 0xececf2,
-        text_dim: 0x9a9aa8,
-        text_faint: 0x666673,
-        accent: 0xffb627,
+        bg: 0x0a0a0a,            // neutral-950
+        surface: 0x171717,       // neutral-900
+        surface_hover: 0x262626, // neutral-800
+        surface_active: 0x333333,
+        hairline: 0x262626,   // neutral-800
+        text: 0xfafafa,       // neutral-50
+        text_dim: 0xa3a3a3,   // neutral-400
+        text_faint: 0x737373, // neutral-500
+        accent: 0xffb627,     // the colour of the application icon
         on_accent: 0x1a1205,
     };
 
     const LIGHT: Palette = Palette {
-        bg: 0xf4f4f6,
+        bg: 0xf8f8f8,
         surface: 0xffffff,
-        surface_hover: 0xeeeef2,
-        surface_active: 0xdfdfe6,
-        hairline: 0xdedee2,
-        text: 0x1b1b21,
-        text_dim: 0x5d5d69,
-        text_faint: 0x8e8e9a,
-        accent: 0xc47f00,
+        surface_hover: 0xf5f5f5,  // neutral-100
+        surface_active: 0xe5e5e5, // neutral-200
+        hairline: 0xe5e5e5,       // neutral-200
+        text: 0x0a0a0a,           // neutral-950
+        text_dim: 0x525252,       // neutral-600
+        text_faint: 0x737373,     // neutral-500
+        // Amber-700. The icon's amber has almost no contrast on white; this is
+        // the same hue carried far enough down the scale to stay legible.
+        accent: 0xb45309,
         on_accent: 0xffffff,
     };
 
@@ -559,10 +565,12 @@ mod gui {
                             .text_color(rgb(p.text_faint))
                             .text_xs(),
                     )
-                    .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    .on_click(move |_e: &ClickEvent, _window: &mut Window, cx: &mut App| {
                         let code = code.clone();
                         let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                            app.open_confirm_dialog(code, window, cx);
+                            let p = app.palette();
+                            let name = app.input_name(&code);
+                            open_confirm(cx, p, code, name);
                         });
                     })
             })
@@ -599,39 +607,47 @@ mod gui {
             .into_any_element()
     }
 
-    /// The confirm dialog's footer.
+    /// A standalone confirmation window.
     ///
-    /// Its own view because the countdown changes every second and a dialog
-    /// footer is a static element: only an entity re-renders. It also owns the
-    /// auto-fire, so "OK" and "ran out" take exactly the same path.
-    struct ConfirmFooter {
+    /// Not a dialog on the main window: a dialog has to be shown to be seen,
+    /// which drags the whole switcher forward. From the menu bar the user asked
+    /// for a confirmation, not for the window.
+    ///
+    /// It is its own view because the countdown changes every second and a
+    /// window's content is built once; it also owns the auto-fire, so "clicked
+    /// Switch" and "ran out" take exactly the same path.
+    struct ConfirmView {
         p: Palette,
-        left: u8,
         code: String,
-        app: WeakEntity<SwitchApp>,
+        name: String,
+        left: u8,
+        /// `None` once the main window is closed: the menu bar can still switch,
+        /// it just has nowhere to report to.
+        app: Option<WeakEntity<SwitchApp>>,
         window: Option<gpui_kit::AnyWindowHandle>,
     }
 
-    impl ConfirmFooter {
+    impl ConfirmView {
         fn new(
             p: Palette,
             code: String,
-            app: WeakEntity<SwitchApp>,
+            name: String,
+            app: Option<WeakEntity<SwitchApp>>,
             window: Option<gpui_kit::AnyWindowHandle>,
             cx: &mut Context<Self>,
         ) -> Self {
-            // Ticking stops on its own: closing the dialog drops this entity,
-            // and the weak upgrade below then fails.
+            // Ticking stops on its own: closing the window drops this entity and
+            // the weak upgrade below then fails.
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let fire = this.update(cx, |footer, cx| {
-                        if footer.left == 0 {
+                    let fire = this.update(cx, |view, cx| {
+                        if view.left == 0 {
                             return false;
                         }
-                        footer.left -= 1;
+                        view.left -= 1;
                         cx.notify();
-                        footer.left == 0
+                        view.left == 0
                     });
                     match fire {
                         Ok(true) => break,
@@ -639,13 +655,28 @@ mod gui {
                         Err(_) => return,
                     }
                 }
-                let _ = this.update(cx, |footer, cx| {
-                    let code = footer.code.clone();
-                    let app = footer.app.clone();
-                    let window = footer.window;
-                    let _ = app.update(cx, |app: &mut SwitchApp, cx| app.fire_switch(code, cx));
+                let _ = this.update(cx, |view, cx| {
+                    let code = view.code.clone();
+                    let app = view.app.clone();
+                    let window = view.window;
+                    match app {
+                        Some(app) => {
+                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
+                                app.fire_switch(code.clone(), cx)
+                            });
+                        }
+                        // No window to drive the switch through, so ask the
+                        // monitor directly -- one shot, like every other write.
+                        None => {
+                            cx.background_spawn(async move {
+                                let _ =
+                                    displaymux::ddc::set_input(0, &code, Duration::from_secs(12));
+                            })
+                            .detach();
+                        }
+                    }
                     if let Some(window) = window {
-                        let _ = window.update(cx, |_, window, cx| window.close_dialog(cx));
+                        let _ = window.update(cx, |_, window, cx| ConfirmView::dismiss(window, cx));
                     }
                 });
             })
@@ -653,129 +684,210 @@ mod gui {
 
             Self {
                 p,
-                left: CONFIRM_SECONDS,
                 code,
+                name,
+                left: CONFIRM_SECONDS,
                 app,
                 window,
             }
         }
     }
 
-    impl Render for ConfirmFooter {
+    impl ConfirmView {
+        /// Close this window and forget it, so the next request opens a new one.
+        fn dismiss(window: &mut Window, cx: &mut App) {
+            cx.global_mut::<Installed>().confirm = None;
+            window.remove_window();
+        }
+    }
+
+    impl Render for ConfirmView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let p = self.p;
             let left = self.left;
             let code = self.code.clone();
+            let name = self.name.clone();
             let app = self.app.clone();
-            let cancel_app = self.app.clone();
 
             div()
                 .flex()
-                .flex_row()
-                .justify_end()
-                .gap_2()
-                .w_full()
+                .flex_col()
+                .size_full()
+                .rounded_lg()
+                .bg(rgb(p.bg))
+                .text_color(rgb(p.text))
+                // A compact title strip: the traffic lights are a system window
+                // decoration and sit above whatever is at y=0, so the content
+                // has to start below them.
                 .child(
                     div()
-                        .id("confirm-cancel")
-                        .px_3()
-                        .py(px(5.0))
-                        .rounded_md()
-                        .bg(rgb(p.surface_active))
-                        .text_color(rgb(p.text_dim))
-                        .text_xs()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x3c3c4a)))
-                        .child(t!("cancel"))
-                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            let _ = cancel_app.update(cx, |app: &mut SwitchApp, cx| {
-                                app.message = String::new().into();
-                                cx.notify();
-                            });
-                            window.close_dialog(cx);
-                        }),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(38.0))
+                        .px(px(16.0))
+                        .border_b(px(1.0))
+                        .border_color(rgb(p.hairline))
+                        .child(
+                            Icon::default()
+                                .data(MARK_SVG)
+                                .text_color(rgb(p.accent))
+                                .with_size(Size::Size(px(13.0))),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(p.text_dim))
+                                .child(t!("confirm_title").to_string()),
+                        ),
                 )
-                .child({
-                    let app = app.clone();
+                .child(
                     div()
-                        .id("confirm-ok")
-                        .px_3()
-                        .py(px(5.0))
-                        .rounded_md()
-                        .bg(rgb(p.accent))
-                        .text_color(rgb(p.on_accent))
-                        .text_xs()
-                        .cursor_pointer()
-                        .hover(|s| s.opacity(0.9))
-                        .child(t!("confirm_switch", count = left))
-                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            let code = code.clone();
-                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
-                                app.fire_switch(code, cx);
-                            });
-                            window.close_dialog(cx);
-                        })
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .p(px(16.0))
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(t!("confirm_body", name = name.as_str()).to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(p.text_faint))
+                                .child(t!("confirm_note").to_string()),
+                        )
+                        .child(
+                            div()
+                                .mt_auto()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child({
+                                    let app = app.clone();
+                                    div()
+                                .id("confirm-cancel")
+                                .px_3()
+                                .py(px(5.0))
+                                .rounded_md()
+                                .bg(rgb(p.surface_active))
+                                .text_color(rgb(p.text_dim))
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .child(t!("cancel"))
+                                .on_click(
+                                    move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                        if let Some(app) = app.clone() {
+                                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
+                                                app.message = String::new().into();
+                                                cx.notify();
+                                            });
+                                        }
+                                        ConfirmView::dismiss(window, cx);
+                                    },
+                                )
+                                })
+                                .child({
+                                    let app = app.clone();
+                                    div()
+                                .id("confirm-ok")
+                                .px_3()
+                                .py(px(5.0))
+                                .rounded_md()
+                                .bg(rgb(p.accent))
+                                .text_color(rgb(p.on_accent))
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.9))
+                                .child(t!("confirm_switch", count = left))
+                                .on_click(
+                                    move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                        let code = code.clone();
+                                        if let Some(app) = app.clone() {
+                                            let _ = app.update(cx, |app: &mut SwitchApp, cx| {
+                                                app.fire_switch(code, cx);
+                                            });
+                                        } else {
+                                            cx.background_spawn(async move {
+                                                let _ = displaymux::ddc::set_input(
+                                                    0,
+                                                    &code,
+                                                    Duration::from_secs(12),
+                                                );
+                                            })
+                                            .detach();
+                                        }
+                                        ConfirmView::dismiss(window, cx);
+                                    },
+                                )
+                                }),
+                        ),
+                )
+        }
+    }
+
+    /// Show the confirmation in its own small window, centred.
+    ///
+    /// Shared by both entrances -- the Switch button and the menu bar -- so
+    /// there is one confirmation to learn rather than two.
+    fn open_confirm(cx: &mut App, p: Palette, code: String, name: String) {
+        // One at a time: a second tray click should not stack windows. The
+        // handle is cleared by `ConfirmView::dismiss`, because a closed window's
+        // handle does not reliably report itself as gone.
+        if cx.global::<Installed>().confirm.is_some() {
+            return;
+        }
+        let app = cx.global::<Installed>().app.clone();
+        let bounds = Bounds::centered(None, size(px(380.0), px(208.0)), cx);
+        let opened = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // No system chrome: a confirmation is not a window you close,
+                // minimise or resize, and three such buttons would offer three
+                // ways to answer a question that has two answers.
+                window_decorations: Some(WindowDecorations::Client),
+                titlebar: None,
+                is_resizable: false,
+                focus: true,
+                ..Default::default()
+            },
+            cx,
+            move |_window, cx| {
+                let code = code.clone();
+                let name = name.clone();
+                let app = app.clone();
+                cx.new(move |cx| {
+                    let window = cx.active_window();
+                    ConfirmView::new(p, code, name, app, window, cx)
                 })
+            },
+        );
+        if let Ok((handle, _)) = opened {
+            cx.global_mut::<Installed>().confirm = Some(handle);
         }
     }
 
     impl SwitchApp {
+        /// How a port is named in a confirmation: its label, then its code.
+        fn input_name(&self, code: &str) -> String {
+            self.status
+                .as_ref()
+                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
+                .map(|i| format!("{} ({})", i.name, i.code))
+                .unwrap_or_else(|| code.to_string())
+        }
+
         fn palette(&self) -> Palette {
             if self.dark {
                 DARK
             } else {
                 LIGHT
             }
-        }
-
-        /// Ask before switching.
-        ///
-        /// The Switch button in the dialog counts down and fires itself; the
-        /// countdown lives in the footer entity rather than here, because a
-        /// dialog footer is built once and a plain element would show "3"
-        /// forever.
-        fn open_confirm_dialog(
-            &mut self,
-            code: String,
-            window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            let name = self
-                .status
-                .as_ref()
-                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
-                .map(|i| format!("{} ({})", i.name, i.code))
-                .unwrap_or_else(|| code.clone());
-            let app = cx.entity().downgrade();
-            let window_handle = cx.active_window();
-            let p = self.palette();
-            let footer = cx.new(|cx| ConfirmFooter::new(p, code, app, window_handle, cx));
-            window.open_dialog(cx, move |dialog, _window, _cx| {
-                let footer = footer.clone();
-                let name = name.clone();
-                dialog
-                    .title(t!("confirm_title").to_string())
-                    .content(move |content, _window, _cx| {
-                        let name = name.clone();
-                        content
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(p.text))
-                                    .child(t!("confirm_body", name = name.as_str()).to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(p.text_faint))
-                                    .child(t!("confirm_note").to_string()),
-                            )
-                    })
-                    .footer(footer)
-            });
         }
 
         /// Send the switch the dialog was opened for.
@@ -1262,6 +1374,9 @@ mod gui {
         /// The window itself, so raising it does not depend on the root entity
         /// type (`gpui_base::Root` once gpui-kit wraps the view).
         window: Option<gpui_kit::AnyWindowHandle>,
+        /// The open confirmation, if any, so a second request does not stack.
+        /// The open confirmation, if any, so a second request does not stack.
+        confirm: Option<gpui_kit::AnyWindowHandle>,
     }
 
     /// The languages this build ships.
@@ -1303,7 +1418,28 @@ mod gui {
     fn forward_to_view(cx: &mut App, event: TrayEvent) {
         let app = cx.global::<Installed>().app.clone();
         if let Some(app) = app {
-            let _ = app.update(cx, |app, cx| app.on_tray(event, cx));
+            if app
+                .update(cx, |app: &mut SwitchApp, cx| app.on_tray(event.clone(), cx))
+                .is_ok()
+            {
+                return;
+            }
+        }
+        // The window is gone. A switch from the menu bar can still confirm
+        // itself: the confirmation is its own window, so nothing has to be
+        // brought forward for it. Port labels are unknown here, which is why
+        // the code stands in for the name.
+        if let TrayEvent::Switch(code) = event {
+            let choice = ThemeChoice::from_setting(Settings::load().theme.as_deref());
+            let dark = match choice {
+                ThemeChoice::Dark => true,
+                ThemeChoice::Light => false,
+                ThemeChoice::System => matches!(
+                    cx.window_appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                ),
+            };
+            open_confirm(cx, if dark { DARK } else { LIGHT }, code.clone(), code);
         }
     }
 
@@ -1423,6 +1559,7 @@ mod gui {
                     tray,
                     app: None,
                     window: None,
+                    confirm: None,
                 });
                 match installed {
                     // Without a tray there is nothing to bring the window back, so

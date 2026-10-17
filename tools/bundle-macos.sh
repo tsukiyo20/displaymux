@@ -4,6 +4,7 @@
 #
 #   tools/bundle-macos.sh              build only -> target/release/displaymux.app
 #   tools/bundle-macos.sh --install    also copy it to /Applications
+#   tools/bundle-macos.sh --dmg        also package -> target/release/dist/*.dmg
 #
 # The bundle carries all three binaries in Contents/MacOS. `dmux` looks for
 # `dmux-ddc-helper` next to its own executable, so keeping them together inside
@@ -23,7 +24,13 @@ app="$out/$app_name.app"
 contents="$app/Contents"
 
 install=false
-[[ "${1:-}" == "--install" ]] && install=true
+make_dmg=false
+for arg in "$@"; do
+    case "$arg" in
+        --install) install=true ;;
+        --dmg) make_dmg=true ;;
+    esac
+done
 
 echo "building displaymux $version"
 cargo build --release --features gui \
@@ -83,6 +90,30 @@ codesign --force --sign - "$app" >/dev/null 2>&1 || \
     echo "warning: ad-hoc signing failed; the bundle should still run locally"
 
 echo "built $app"
+
+# The updater installs from a disk image: it mounts the .dmg read-only, copies
+# the .app out, and swaps it in. A zip would need a different code path, so the
+# release artifact is a .dmg.
+if $make_dmg; then
+    arch="$(uname -m)"
+    # The updater picks its asset by architecture, so the name has to carry it.
+    [[ "$arch" == "arm64" ]] && arch="arm64" || arch="x86_64"
+    dist="$out/dist"
+    dmg="$dist/$app_name-$version-macos-$arch.dmg"
+    mkdir -p "$dist"
+    rm -f "$dmg"
+
+    staging="$(mktemp -d)"
+    trap 'rm -rf "$staging"' EXIT
+    cp -R "$app" "$staging/"
+    # The usual drag-to-install layout.
+    ln -s /Applications "$staging/Applications"
+
+    echo "packaging $dmg"
+    hdiutil create -quiet -volname "$app_name" -srcfolder "$staging" \
+        -ov -format UDZO "$dmg"
+    echo "built $dmg"
+fi
 
 if $install; then
     dest="/Applications/$app_name.app"

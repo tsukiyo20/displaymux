@@ -33,8 +33,20 @@ pub fn current() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semver")
 }
 
+/// Releases are published per architecture, and the asset name carries it, so
+/// an Apple Silicon build never downloads an Intel one. A universal build would
+/// have to drop this filter.
+fn arch_pattern() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 fn engine() -> UpdateEngine<GitHubSource> {
-    let source = GitHubSource::new(OWNER, REPO).with_checksums(SUMS_ASSET);
+    let source = GitHubSource::new(OWNER, REPO)
+        .with_checksums(SUMS_ASSET)
+        .asset_contains(arch_pattern());
     UpdateEngine::new(source, EngineConfig::new(current()))
 }
 

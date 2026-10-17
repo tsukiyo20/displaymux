@@ -1,0 +1,87 @@
+name: release
+
+# Publishing is a tag push. Everything the updater reads -- the release, its
+# assets, and the checksums it verifies them against -- is produced here, so
+# there is no update server and no feed file that can fall out of date.
+on:
+  push:
+    tags: ["v*"]
+  # Lets the packaging be exercised without publishing anything.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+
+      - name: Test
+        run: cargo test --release
+
+      # Builds the .app, signs it ad-hoc, and packages the disk image the
+      # updater installs from. The volume name and layout match what a person
+      # dragging the app to /Applications expects, because they get the same
+      # file.
+      - name: Bundle and package
+        run: ./tools/bundle-macos.sh --dmg
+
+      # The updater asks for SHA256SUMS and refuses a download it cannot check.
+      - name: Checksums
+        run: |
+          cd target/release/dist
+          shasum -a 256 ./*.dmg > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/dist/*.dmg
+            target/release/dist/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release --features gui --bins
+
+      # A zip, not an installer: the app ships two executables and the updater's
+      # Windows path replaces the running one, which would leave the DDC helper
+      # behind. Until there is an installer to hand to msiexec, Windows updates
+      # are a manual unzip.
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $stage = "displaymux-$version-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target/release/dmux.exe, target/release/dmux-gui.exe, target/release/dmux-ddc-helper.exe $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: displaymux-*-windows-x86_64.zip
+          fail_on_unmatched_files: true

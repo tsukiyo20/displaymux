@@ -94,13 +94,48 @@ tools/bundle-macos.sh              # -> target/release/displaymux.app
 tools/bundle-macos.sh --install    # also copies it to /Applications
 ```
 
+`--dmg` additionally packages `target/release/dist/displaymux-<version>-macos-<arch>.dmg`,
+which is the artifact releases are published as.
+
 All three binaries live in `Contents/MacOS`, which is what lets the GUI find
 `dmux-ddc-helper` beside itself with no configuration. The command line tool is
 then at `/Applications/displaymux.app/Contents/MacOS/dmux`; symlink it somewhere
 on your `PATH` if you want it under the plain name.
 
-The bundle is ad-hoc signed rather than notarised, so it runs locally but macOS
-will warn if it is copied to another machine. Add `LSUIElement` to the
+### Installing a release
+
+Download the `.dmg` from the [releases page](https://github.com/tsukiyo20/displaymux/releases),
+open it, and drag `displaymux.app` to `/Applications`.
+
+The bundles are signed ad-hoc rather than with a Developer ID and are not
+notarised, so the first launch of a downloaded copy is refused by Gatekeeper.
+Clear the quarantine flag once, after copying it to `/Applications`:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/displaymux.app
+```
+
+Nothing else is needed; the app is self-contained and the flag does not come
+back. Updates downloaded by the app itself are not quarantined, so this is only
+ever a first-install step.
+
+### Updates
+
+The app checks the repository's latest release once per launch, in the
+background, and says nothing if the check fails. When a newer version exists a
+small pill appears in the header and the menu bar entry changes to name it;
+either opens a window that downloads the disk image, verifies its SHA-256
+against the release's `SHA256SUMS`, swaps the bundle in, and restarts. The old
+bundle is kept aside until the new one is in place, so a failed swap leaves the
+installed app alone.
+
+Publishing is a tag push: `.github/workflows/release.yml` builds and packages
+both platforms on `v*` and attaches the artifacts and checksums to the release.
+Nothing else has to be kept in sync.
+
+Windows builds are published as a zip and updated by hand: the app ships two
+executables, and replacing only the running one would leave the DDC helper
+behind. Add `LSUIElement` to the
 `Info.plist` the script writes if you would rather it were a pure menu bar app
 with no Dock icon.
 

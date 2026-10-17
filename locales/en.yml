@@ -8,6 +8,8 @@ unlisted: unlisted
 inputs_available: "%{count} inputs available"
 no_inputs: monitor did not report any switchable inputs
 read_failed: "read failed: %{error}"
+reverted: "the monitor went back to the previous input (the target port has no signal)"
+switch_failed_short: "the monitor did not accept the switch"
 switch_failed: "switch failed: %{error}"
 switching_to: "switching to %{code}..."
 saved: "Port labels saved"

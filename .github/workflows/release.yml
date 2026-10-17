@@ -153,14 +153,15 @@ jobs:
             "-dVersion=$version"
             "-dBinDir=$binDir"
             "-dIconPath=$icon"
-            "-out=$obj\main.wixobj"
+            "-out"
+            "$obj\main.wixobj"
             "packaging/windows/main.wxs"
           )
           Write-Host "candle $($candleArgs -join ' ')"
           & (Join-Path $wixBin "candle.exe") @candleArgs
           if ($LASTEXITCODE -ne 0) { throw "candle failed" }
 
-          $lightArgs = @("-nologo", "-out=$msi", "$obj\main.wixobj")
+          $lightArgs = @("-nologo", "-out", $msi, "$obj\main.wixobj")
           Write-Host "light $($lightArgs -join ' ')"
           & (Join-Path $wixBin "light.exe") @lightArgs
           if ($LASTEXITCODE -ne 0) { throw "light failed" }

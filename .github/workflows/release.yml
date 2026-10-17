@@ -52,8 +52,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Explicit rather than the action's `targets` input: this fails loudly if
+      # a target cannot be installed, instead of leaving the build to discover
+      # it as "can't find crate for `core`" twenty minutes later.
+      - name: Cross-compile targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -118,8 +122,11 @@ jobs:
           if (-not (Test-Path $makensis)) {
             throw "makensis.exe not found"
           }
-          $out = "dist/displaymux-${{ steps.version.outputs.value }}-windows-x86_64-setup.exe"
-          & $makensis /DVERSION=${{ steps.version.outputs.value }} /DBINDIR=target\release /DOUTFILE=$out packaging/windows/installer.nsi
+          # makensis resolves File and OutFile against the script's directory,
+          # not the working directory, so both have to be absolute.
+          $out = "${{ github.workspace }}\dist\displaymux-${{ steps.version.outputs.value }}-windows-x86_64-setup.exe"
+          $bin = "${{ github.workspace }}\target\release"
+          & $makensis "/DVERSION=${{ steps.version.outputs.value }}" "/DBINDIR=$bin" "/DOUTFILE=$out" packaging/windows/installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
 
       - name: MSI installer

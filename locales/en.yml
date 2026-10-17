@@ -10,6 +10,8 @@ switch_failed_short: "the monitor did not accept the switch"
 switch_failed: "switch failed: %{error}"
 switching_to: "switching to %{code}..."
 
+edit_label: "Port label"
+switch: Switch
 save: Save
 cancel: Cancel
 

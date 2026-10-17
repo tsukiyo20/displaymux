@@ -9,6 +9,8 @@ switch_failed_short: "显示器没有接受这次切换"
 switch_failed: "切换失败：%{error}"
 switching_to: "正在切换到 %{code}..."
 
+edit_label: "端口标签"
+switch: 切换
 save: 保存
 cancel: 取消
 

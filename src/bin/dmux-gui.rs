@@ -78,7 +78,7 @@ mod gui {
     use displaymux::settings::Settings;
     use displaymux::tray::{Tray, TrayEvent};
     use gpui_kit::component::input::{Input, InputState};
-    use gpui_kit::component::{Icon, IconName, Sizable, Size};
+    use gpui_kit::component::{Icon, IconName, Sizable, Size, WindowExt as _};
     // `gpui_kit::*` is GPUI: the facade re-exports `gpui-pre` wholesale, so the
     // element and app types come from the same place as before.
     use gpui_kit::{
@@ -91,6 +91,9 @@ mod gui {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// Seconds between arming a switch and it happening. Long enough to read
+    /// the countdown, short enough not to be in the way.
+    const CONFIRM_SECONDS: u8 = 3;
     const READ_TIMEOUT: Duration = Duration::from_secs(12);
     const POLL_INTERVAL: Duration = Duration::from_millis(60);
     /// Tray clicks are checked on a timer; the menu bar is a secondary surface
@@ -214,6 +217,11 @@ mod gui {
         editing: Option<(String, Entity<InputState>)>,
         /// Whether the language list is showing.
         lang_open: bool,
+        /// The port awaiting confirmation, and the seconds left on it.
+        confirm: Option<String>,
+        confirm_left: u8,
+        /// Bumped by every arm or cancel so a stale countdown stops ticking.
+        confirm_gen: u64,
     }
 
     impl SwitchApp {
@@ -230,6 +238,9 @@ mod gui {
                 settings: Settings::load(),
                 editing: None,
                 lang_open: false,
+                confirm: None,
+                confirm_left: CONFIRM_SECONDS,
+                confirm_gen: 0,
             };
             app.poll(cx);
             app
@@ -377,6 +388,10 @@ mod gui {
         }
     }
 
+    /// One place for the palette, so nothing drifts apart.
+    ///
+    /// The accent is the amber from the application icon: it is the one colour
+    /// that already means "this tool" everywhere else it appears.
     mod look {
         pub const BG: u32 = 0x141419;
         pub const SURFACE: u32 = 0x1d1d24;
@@ -387,32 +402,148 @@ mod gui {
         pub const TEXT_DIM: u32 = 0x9a9aa8;
         pub const TEXT_FAINT: u32 = 0x666673;
         pub const ACCENT: u32 = 0xffb627;
+        pub const ON_ACCENT: u32 = 0x1a1205;
     }
 
-    /// The application mark, redrawn for a 24px box and in a single colour.
+    /// The application mark, redrawn for a 24px box in a single colour.
     ///
     /// The shipped `assets/mark.svg` carries the amber/dormant pair, but an
     /// `Icon` tints the whole SVG with one colour, so a two-tone mark would be
-    /// flattened into a grey smear at this size. Same geometry, one colour,
-    /// tinted with the accent instead.
-    /// Lucide's pencil, inline: the bundled component icons have no pencil.
+    /// flattened at this size. Same geometry, tinted with the accent.
+    const MARK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5.4V9.5L12 14.1"/><path d="M8 3.2V9.5L12 14.1V20.8"/></svg>"#;
+
+    /// Lucide's pencil. The bundled component icons have no pencil.
     const PENCIL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>"#;
 
-    const MARK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5.4V9.5L12 14.1"/><path d="M8 3.2V9.5L12 14.1V20.8"/></svg>"#;
+    /// Lucide's `languages`: the A beside a CJK glyph, which is the icon
+    /// i18n is conventionally drawn with. Also missing from the bundled set.
+    const LANGUAGES_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>"#;
 
     /// One switchable input.
     ///
-    /// A row is an action, never a reading. The trailing pencil edits the
-    /// label in place, which is where the label belongs: the name describes
-    /// this port, so it is edited next to it rather than in a separate pane.
+    /// The row is not a button. Switching is a deliberate act with its own hit
+    /// area, because a stray click here takes the display -- and, on a desk
+    /// where the peripherals hang off the monitor, the keyboard and mouse --
+    /// away from this machine.
     fn input_row(
         code: String,
         name: String,
         advertised: bool,
-        editor: Option<Entity<InputState>>,
+        confirm_left: Option<u8>,
         weak: WeakEntity<SwitchApp>,
     ) -> gpui_kit::AnyElement {
-        let row = div()
+        let trailing = match confirm_left {
+            // Confirming: the countdown is the button, and cancelling is next
+            // to it, so the whole decision stays under one finger.
+            Some(left) => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child({
+                    let weak = weak.clone();
+                    div()
+                        .id(SharedString::from(format!("cancel-{}", code)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.0))
+                        .rounded_md()
+                        .bg(rgb(look::SURFACE_ACTIVE))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x3c3c4a)))
+                        .child(
+                            Icon::new(IconName::Close)
+                                .text_color(rgb(look::TEXT_DIM))
+                                .text_sm(),
+                        )
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.cancel_confirm(cx);
+                            });
+                        })
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(24.0))
+                        .w(px(30.0))
+                        .rounded_md()
+                        .bg(rgb(look::ACCENT))
+                        .text_xs()
+                        .text_color(rgb(look::ON_ACCENT))
+                        .child(format!("{}", left)),
+                )
+                .into_any_element(),
+            None => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child({
+                    let weak = weak.clone();
+                    let code = code.clone();
+                    div()
+                        .id(SharedString::from(format!("edit-{}", code)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                        .child(
+                            Icon::default()
+                                .data(PENCIL_SVG)
+                                .text_color(rgb(look::TEXT_FAINT))
+                                .text_sm(),
+                        )
+                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let code = code.clone();
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.open_edit_dialog(code, window, cx);
+                            });
+                        })
+                })
+                .child({
+                    let weak = weak.clone();
+                    let code = code.clone();
+                    div()
+                        .id(SharedString::from(format!("switch-{}", code)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .h(px(24.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(look::SURFACE_ACTIVE))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x3c3c4a)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(look::TEXT_DIM))
+                                .child(t!("switch")),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .text_color(rgb(look::TEXT_FAINT))
+                                .text_xs(),
+                        )
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let code = code.clone();
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.start_confirm(code, cx);
+                            });
+                        })
+                })
+                .into_any_element(),
+        };
+
+        div()
             .id(SharedString::from(format!("input-{}", code)))
             .flex()
             .flex_row()
@@ -420,106 +551,178 @@ mod gui {
             .gap_3()
             .w_full()
             .px_3()
-            .py(px(11.0))
+            .py(px(9.0))
             .rounded_lg()
             .bg(rgb(look::SURFACE))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
             .child(
                 div()
                     .w(px(34.0))
                     .text_sm()
                     .text_color(rgb(look::TEXT_FAINT))
-                    .child(code.clone()),
-            );
-
-        if let Some(editor) = editor {
-            return row
-                .child(div().flex_1().child(Input::new(&editor)))
-                .into_any_element();
-        }
-
-        row.child(
-            div()
-                .flex_1()
-                .text_sm()
-                .text_color(rgb(look::TEXT))
-                .child(name),
-        )
-        .when(!advertised, |d| {
-            d.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(look::TEXT_FAINT))
-                    .child(t!("unlisted")),
+                    .child(code),
             )
-        })
-        .child({
-            let weak = weak.clone();
-            let code = code.clone();
-            div()
-                .id(SharedString::from(format!("edit-{}", code)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(22.0))
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
-                .child(
-                    Icon::default()
-                        .data(PENCIL_SVG)
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(rgb(look::TEXT))
+                    .child(name),
+            )
+            .when(!advertised, |d| {
+                d.child(
+                    div()
+                        .text_xs()
                         .text_color(rgb(look::TEXT_FAINT))
-                        .text_sm(),
+                        .child(t!("unlisted")),
                 )
-                .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    let code = code.clone();
-                    let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                        app.start_editing(code, window, cx);
-                    });
-                })
-        })
-        .child(
-            Icon::new(IconName::ChevronRight)
-                .text_color(rgb(look::TEXT_FAINT))
-                .text_sm(),
-        )
-        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-            let code = code.clone();
-            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                app.send(
-                    Request::Switch {
-                        index: app.index,
-                        code: code.clone(),
-                    },
-                    t!("switching_to", code = code.as_str()),
-                    cx,
-                );
-            });
-        })
-        .into_any_element()
+            })
+            .child(trailing)
+            .into_any_element()
     }
 
     impl SwitchApp {
-        /// Begin editing one port's label.
-        fn start_editing(&mut self, code: String, window: &mut Window, cx: &mut Context<Self>) {
+        /// Arm a switch. It fires when the countdown runs out; the point of the
+        /// delay is that switching is not reversible from this side.
+        fn start_confirm(&mut self, code: String, cx: &mut Context<Self>) {
+            self.confirm_gen += 1;
+            let generation = self.confirm_gen;
+            self.confirm = Some(code.clone());
+            self.confirm_left = CONFIRM_SECONDS;
+            cx.notify();
+
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let fire = this.update(cx, |app, cx| {
+                        // A cancel or a newer request invalidates this countdown.
+                        if app.confirm_gen != generation
+                            || app.confirm.as_deref() != Some(code.as_str())
+                        {
+                            return false;
+                        }
+                        app.confirm_left = app.confirm_left.saturating_sub(1);
+                        cx.notify();
+                        app.confirm_left == 0
+                    });
+                    match fire {
+                        Ok(true) => {
+                            let _ = this.update(cx, |app, cx| {
+                                app.confirm = None;
+                                app.send(
+                                    Request::Switch {
+                                        index: app.index,
+                                        code: code.clone(),
+                                    },
+                                    t!("switching_to", code = code.as_str()),
+                                    cx,
+                                );
+                            });
+                            break;
+                        }
+                        Ok(false) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+            .detach();
+        }
+
+        fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+            self.confirm_gen += 1;
+            self.confirm = None;
+            cx.notify();
+        }
+
+        /// Edit one port's label in a dialog.
+        ///
+        /// The field is created before the dialog opens and captured by its
+        /// builder: the builder is a render closure that may run more than
+        /// once, and creating the state inside it would reset the text.
+        fn open_edit_dialog(&mut self, code: String, window: &mut Window, cx: &mut Context<Self>) {
             let current = self
                 .status
                 .as_ref()
                 .and_then(|s| s.inputs.iter().find(|i| i.code == code))
                 .map(|i| i.name.clone())
                 .unwrap_or_default();
-            let editor = cx.new(|cx| InputState::new(window, cx).default_value(current));
-            self.editing = Some((code, editor));
-            cx.notify();
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+            self.editing = Some((code.clone(), input.clone()));
+
+            let weak = cx.entity().downgrade();
+            window.open_dialog(cx, move |dialog, _window, _cx| {
+                let input = input.clone();
+                let weak = weak.clone();
+                let code = code.clone();
+                // An explicit footer: the default one renders no buttons unless
+                // `show_cancel` is asked for, and the styling has to match the
+                // rest of the window anyway.
+                dialog
+                    .title(t!("edit_label").to_string())
+                    .content(move |content, _window, _cx| content.child(Input::new(&input)))
+                    .footer(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .w_full()
+                            .child({
+                                let weak = weak.clone();
+                                let code = code.clone();
+                                div()
+                                    .id("dialog-save")
+                                    .px_3()
+                                    .py(px(5.0))
+                                    .rounded_md()
+                                    .bg(rgb(look::ACCENT))
+                                    .text_color(rgb(look::ON_ACCENT))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .hover(|s| s.opacity(0.9))
+                                    .child(t!("save"))
+                                    .on_click(
+                                        move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                            let code = code.clone();
+                                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                                app.commit_edit(&code, cx);
+                                            });
+                                            window.close_dialog(cx);
+                                        },
+                                    )
+                            })
+                            .child({
+                                let weak = weak.clone();
+                                div()
+                                    .id("dialog-cancel")
+                                    .px_3()
+                                    .py(px(5.0))
+                                    .rounded_md()
+                                    .bg(rgb(look::SURFACE_ACTIVE))
+                                    .text_color(rgb(look::TEXT_DIM))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x3c3c4a)))
+                                    .child(t!("cancel"))
+                                    .on_click(
+                                        move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                                app.editing = None;
+                                                cx.notify();
+                                            });
+                                            window.close_dialog(cx);
+                                        },
+                                    )
+                            }),
+                    )
+            });
         }
 
-        /// Persist the label for the row being edited, then reload.
+        /// Persist the edited label, then reload so the row shows it.
         ///
-        /// An empty field, or one that still holds the name the monitor reports,
-        /// removes the label instead of freezing that name in place.
-        fn commit_edit(&mut self, cx: &mut Context<Self>) {
-            let Some((code, editor)) = self.editing.take() else {
+        /// An empty field, or one still holding the name the monitor reports,
+        /// removes the label rather than freezing that name in place.
+        fn commit_edit(&mut self, code: &str, cx: &mut Context<Self>) {
+            let Some((_, editor)) = self.editing.take() else {
                 return;
             };
             let Some(display) = self.status.as_ref().map(|s| s.display_id.clone()) else {
@@ -531,9 +734,9 @@ mod gui {
                 .unwrap_or_default();
             let mut labels = Labels::load();
             if text.is_empty() || text == mccs {
-                labels.clear(&display, &code);
+                labels.clear(&display, code);
             } else {
-                labels.set(&display, &code, &text);
+                labels.set(&display, code, &text);
             }
             match labels.save() {
                 Ok(_) => self.send(Request::Refresh, t!("reading"), cx),
@@ -556,14 +759,78 @@ mod gui {
             cx.notify();
         }
 
-        /// The custom title bar: the mark, the name, and the language picker.
+        /// The custom title bar.
         ///
-        /// The window is created with a transparent system titlebar and the
-        /// traffic lights pushed right, so this strip is where they sit and the
-        /// content starts after them.
+        /// The language picker expands *in the bar* rather than floating over
+        /// the content: a hand-positioned overlay is one layout change away
+        /// from sitting under its own backdrop, and did.
         fn title_bar(&self, cx: &Context<Self>) -> impl IntoElement {
             let weak = cx.entity().downgrade();
             let current = self.settings.locale.clone().unwrap_or_default();
+
+            let picker: gpui_kit::AnyElement = if self.lang_open {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .children(LOCALES.iter().map(|(tag, name)| {
+                        let tag = *tag;
+                        let selected = tag == current;
+                        let weak = weak.clone();
+                        div()
+                            .id(SharedString::from(format!("lang-{tag}")))
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded_md()
+                            .bg(if selected {
+                                rgb(look::SURFACE_ACTIVE)
+                            } else {
+                                rgb(look::SURFACE)
+                            })
+                            .text_xs()
+                            .text_color(if selected {
+                                rgb(look::TEXT)
+                            } else {
+                                rgb(look::TEXT_DIM)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(look::SURFACE_ACTIVE)))
+                            .child(*name)
+                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                    app.choose_language(tag, cx);
+                                });
+                            })
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            } else {
+                let weak = weak.clone();
+                div()
+                    .id("language")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(28.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
+                    .child(
+                        Icon::default()
+                            .data(LANGUAGES_SVG)
+                            .text_color(rgb(look::TEXT_DIM))
+                            .with_size(Size::Size(px(17.0))),
+                    )
+                    .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                        let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                            app.lang_open = true;
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            };
+
             div()
                 .flex()
                 .flex_row()
@@ -593,107 +860,7 @@ mod gui {
                                 .child("displaymux"),
                         ),
                 )
-                .child({
-                    let weak = weak.clone();
-                    div()
-                        .id("language")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py(px(4.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-                        .child(
-                            Icon::new(IconName::Globe)
-                                .text_color(rgb(look::TEXT_DIM))
-                                .text_sm(),
-                        )
-                        .child(div().text_xs().text_color(rgb(look::TEXT_FAINT)).child(
-                            if current.is_empty() {
-                                "EN".to_string()
-                            } else {
-                                current.to_uppercase()
-                            },
-                        ))
-                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.lang_open = !app.lang_open;
-                                cx.notify();
-                            });
-                        })
-                })
-        }
-
-        /// The language list, drawn over the content under the title bar.
-        fn language_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
-            let weak = cx.entity().downgrade();
-            let current = self.settings.locale.clone().unwrap_or_default();
-            let options: Vec<gpui_kit::AnyElement> = LOCALES
-                .iter()
-                .map(|(tag, name)| {
-                    let tag = *tag;
-                    let selected = tag == current;
-                    let weak = weak.clone();
-                    div()
-                        .id(SharedString::from(format!("lang-{tag}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .px_2()
-                        .py(px(7.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-                        .when(selected, |d| d.bg(rgb(look::SURFACE_ACTIVE)))
-                        .child(div().text_sm().text_color(rgb(look::TEXT)).child(*name))
-                        .when(selected, |d| {
-                            d.child(
-                                Icon::new(IconName::Check)
-                                    .text_color(rgb(look::ACCENT))
-                                    .text_sm(),
-                            )
-                        })
-                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.choose_language(tag, cx);
-                            });
-                        })
-                        .into_any_element()
-                })
-                .collect();
-
-            div()
-                .absolute()
-                .inset_0()
-                .child({
-                    let weak = weak.clone();
-                    div().absolute().inset_0().on_mouse_down(
-                        gpui_kit::MouseButton::Left,
-                        move |_e, _w, cx| {
-                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                app.lang_open = false;
-                                cx.notify();
-                            });
-                        },
-                    )
-                })
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(50.0))
-                        .right(px(10.0))
-                        .w(px(168.0))
-                        .p_1()
-                        .rounded_lg()
-                        .bg(rgb(look::SURFACE))
-                        .border_1()
-                        .border_color(rgb(look::HAIRLINE))
-                        .children(options),
-                )
+                .child(picker)
         }
 
         fn main_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -705,8 +872,8 @@ mod gui {
                 .as_ref()
                 .map(|s| s.display_id.clone())
                 .unwrap_or_else(|| t!("no_monitor").to_string());
-            let editing = self.editing.as_ref().map(|(code, _)| code.clone());
-            let editor = self.editing.as_ref().map(|(_, e)| e.clone());
+            let confirm = self.confirm.clone();
+            let confirm_left = self.confirm_left;
 
             let rows: Vec<gpui_kit::AnyElement> = self
                 .status
@@ -715,8 +882,8 @@ mod gui {
                     s.inputs
                         .iter()
                         .map(|i| {
-                            let this_editor = if editing.as_deref() == Some(i.code.as_str()) {
-                                editor.clone()
+                            let left = if confirm.as_deref() == Some(i.code.as_str()) {
+                                Some(confirm_left)
                             } else {
                                 None
                             };
@@ -724,7 +891,7 @@ mod gui {
                                 i.code.clone(),
                                 i.name.clone(),
                                 i.advertised,
-                                this_editor,
+                                left,
                                 weak.clone(),
                             )
                         })
@@ -794,64 +961,11 @@ mod gui {
                 .child(
                     div()
                         .mt_auto()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
                         .px(px(16.0))
                         .pb(px(14.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(look::TEXT_FAINT))
-                                .child(message),
-                        )
-                        .when(self.editing.is_some(), |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .gap_2()
-                                    .child({
-                                        let weak = weak.clone();
-                                        div()
-                                            .id("commit-edit")
-                                            .px_3()
-                                            .py(px(5.0))
-                                            .rounded_md()
-                                            .bg(rgb(look::ACCENT))
-                                            .text_color(rgb(0x1a1205))
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .child(t!("save"))
-                                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                                    app.commit_edit(cx);
-                                                });
-                                            })
-                                    })
-                                    .child({
-                                        let weak = weak.clone();
-                                        div()
-                                            .id("cancel-edit")
-                                            .px_3()
-                                            .py(px(5.0))
-                                            .rounded_md()
-                                            .bg(rgb(look::SURFACE))
-                                            .text_color(rgb(look::TEXT_DIM))
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(look::SURFACE_HOVER)))
-                                            .child(t!("cancel"))
-                                            .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                                                let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
-                                                    app.editing = None;
-                                                    cx.notify();
-                                                });
-                                            })
-                                    }),
-                            )
-                        }),
+                        .text_xs()
+                        .text_color(rgb(look::TEXT_FAINT))
+                        .child(message),
                 )
                 .into_any_element()
         }
@@ -859,14 +973,11 @@ mod gui {
 
     impl Render for SwitchApp {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let pane = self.main_pane(cx);
             div()
-                .relative()
                 .size_full()
                 .bg(rgb(look::BG))
                 .text_color(rgb(look::TEXT))
-                .child(pane)
-                .when(self.lang_open, |d| d.child(self.language_overlay(cx)))
+                .child(self.main_pane(cx))
         }
     }
 

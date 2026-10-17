@@ -115,12 +115,20 @@ jobs:
       - name: NSIS installer
         shell: pwsh
         run: |
-          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) {
+          # The image sometimes has NSIS and sometimes does not, and the
+          # Chocolatey feed answers 504 often enough to be worth retrying.
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          for ($i = 1; -not $makensis -and $i -le 3; $i++) {
             choco install nsis --no-progress -y
+            $makensis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $makensis) { Start-Sleep -Seconds 15 }
           }
-          if (-not (Test-Path $makensis)) {
-            throw "makensis.exe not found"
+          if (-not $makensis) {
+            throw "makensis.exe not found after 3 attempts"
           }
           # makensis resolves File and OutFile against the script's directory,
           # not the working directory, so both have to be absolute.

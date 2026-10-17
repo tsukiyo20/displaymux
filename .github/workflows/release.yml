@@ -136,21 +136,33 @@ jobs:
           $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
             Select-Object -First 1
           if (-not $wix) { throw "WiX toolset not found" }
-          $bin = Join-Path $wix.FullName "bin"
-          $obj = "dist/wixobj"
+          $wixBin = Join-Path $wix.FullName "bin"
+
+          $version = "${{ steps.version.outputs.value }}"
+          $binDir  = "${{ github.workspace }}\target\release"
+          $icon    = "${{ github.workspace }}\assets\icon.ico"
+          $obj     = "dist/wixobj"
+          $msi     = "dist/displaymux-$version-windows-x86_64.msi"
           New-Item -ItemType Directory -Force -Path $obj | Out-Null
 
-          & (Join-Path $bin "candle.exe") -nologo `
-            -dVersion=${{ steps.version.outputs.value }} `
-            -dBinDir="${{ github.workspace }}\target\release" `
-            -dIconPath="${{ github.workspace }}\assets\icon.ico" `
-            -out "$obj\main.wixobj" `
-            packaging/windows/main.wxs
+          # Every define is quoted. Unquoted, PowerShell hands
+          # `-dVersion=0.1.0` to candle as something other than one argument,
+          # and candle reads the remainder as a source file.
+          $candleArgs = @(
+            "-nologo"
+            "-dVersion=$version"
+            "-dBinDir=$binDir"
+            "-dIconPath=$icon"
+            "-out=$obj\main.wixobj"
+            "packaging/windows/main.wxs"
+          )
+          Write-Host "candle $($candleArgs -join ' ')"
+          & (Join-Path $wixBin "candle.exe") @candleArgs
           if ($LASTEXITCODE -ne 0) { throw "candle failed" }
 
-          & (Join-Path $bin "light.exe") -nologo `
-            -out "dist/displaymux-${{ steps.version.outputs.value }}-windows-x86_64.msi" `
-            "$obj\main.wixobj"
+          $lightArgs = @("-nologo", "-out=$msi", "$obj\main.wixobj")
+          Write-Host "light $($lightArgs -join ' ')"
+          & (Join-Path $wixBin "light.exe") @lightArgs
           if ($LASTEXITCODE -ne 0) { throw "light failed" }
 
       - uses: actions/upload-artifact@v4

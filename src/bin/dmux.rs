@@ -412,6 +412,51 @@ fn cmd_list() -> Result<(), DdcError> {
     Ok(())
 }
 
+/// Check for, or install, a newer release.
+///
+/// `--check` only reports, which is what a script or the GUI's background check
+/// wants. Without it, an available release is downloaded and swapped in, so the
+/// updater can be exercised without touching the window.
+fn cmd_update(args: &[String]) -> Result<(), DdcError> {
+    let check_only = args.iter().any(|a| a == "--check");
+    let wrap = |e: String| DdcError::Protocol(e);
+
+    match displaymux::update::check().map_err(wrap)? {
+        None => {
+            println!(
+                "up to date ({} is the latest release)",
+                displaymux::update::current()
+            );
+            Ok(())
+        }
+        Some(available) => {
+            println!(
+                "available : v{}  (running {})",
+                available.version,
+                displaymux::update::current()
+            );
+            println!("asset     : {}", available.asset_name);
+            println!("release   : {}", available.page);
+            if check_only {
+                return Ok(());
+            }
+
+            let mut last_step = 0u64;
+            displaymux::update::install(move |done, total| {
+                // Ten lines per download, not one per chunk.
+                let step = done * 10 / total.filter(|t| *t > 0).unwrap_or(1).max(1);
+                if step > last_step {
+                    last_step = step;
+                    eprintln!("  {}%", step * 10);
+                }
+            })
+            .map_err(wrap)?;
+            println!("installed");
+            Ok(())
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
@@ -430,6 +475,7 @@ fn main() {
         "vcp" => cmd_vcp(rest),
         "labels" => cmd_labels(rest),
         "label" => cmd_label(rest),
+        "update" => cmd_update(rest),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())

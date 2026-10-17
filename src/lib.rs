@@ -27,4 +27,5 @@ pub mod ddc;
 pub mod labels;
 pub mod settings;
 pub mod tray;
+pub mod update;
 pub mod vcp;

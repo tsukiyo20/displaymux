@@ -60,6 +60,8 @@ async-channel = "2.5"
 # unifies them and one `set_locale` drives both our strings and the component
 # library's.
 rust-i18n = "4"
+gpui-updater-core = "0.3"
+semver = "1"
 
 [features]
 default = []

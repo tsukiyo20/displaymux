@@ -24,6 +24,9 @@ USAGE:
                                             selected -- the tug-of-war that lets a Mac
                                             reclaim the monitor from the other machine
     dmux bright <0-100> [--index=N]        set brightness
+    dmux labels [--index=N]                show the port-label file and any labels
+    dmux label <code> <name> [--index=N]   name a port, e.g.
+                                            dmux label 0x10 "Type-C - Mac"
     dmux vcp <code> [<code>...] [--index=N]
                                             read arbitrary VCP codes, e.g.
                                             `dmux vcp 0x60 0xae`. Useful for
@@ -114,6 +117,83 @@ fn cmd_status(args: &[String]) -> Result<(), DdcError> {
         println!("caps raw  : {}", c.trim());
     }
     println!("latency   : {} ms", st.elapsed_ms);
+    Ok(())
+}
+
+/// Show where the label file is and what it currently says.
+fn cmd_labels(args: &[String]) -> Result<(), DdcError> {
+    use displaymux::labels::Labels;
+    let path = displaymux::labels::labels_path();
+    match &path {
+        Some(p) => println!("labels file : {}", p.display()),
+        None => println!("labels file : (no config directory)"),
+    }
+    let labels = Labels::load();
+    if labels.is_empty() {
+        println!("labels      : none defined, MCCS port names are used as-is");
+    } else {
+        println!("labels      :");
+        let mut displays: Vec<_> = labels.entries().collect();
+        displays.sort_by(|a, b| a.0.cmp(b.0));
+        for (display, entries) in displays {
+            let mut codes: Vec<_> = entries.iter().collect();
+            codes.sort_by(|a, b| a.0.cmp(b.0));
+            for (code, label) in codes {
+                println!("  {:<12} {} = {}", display, code, label);
+            }
+        }
+    }
+    // caps=true: without the capability string the port list falls back to the
+    // MCCS table, which invents ports this monitor does not have.
+    if let Ok(st) = ddc::status_retrying(
+        index_of(args),
+        true,
+        2,
+        DEFAULT_TIMEOUT,
+        Duration::from_millis(1200),
+    ) {
+        println!();
+        println!("as shown for [{}] {}:", st.display_index, st.display_id);
+        print_inputs(&st);
+    }
+    Ok(())
+}
+
+/// Name one port on the monitor at `--index`.
+fn cmd_label(args: &[String]) -> Result<(), DdcError> {
+    use displaymux::labels::Labels;
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--") && !a.starts_with('-'))
+        .collect();
+    if rest.len() < 2 {
+        eprintln!(
+            "usage: dmux label <code> <name> [--index=N]   e.g. dmux label 0x10 \"Type-C - Mac\""
+        );
+        std::process::exit(2);
+    }
+    let code = rest[0].clone();
+    let name = rest[1..]
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The display id is needed because labels are per monitor, so ask the
+    // hardware which one this index is.
+    let st = ddc::status_retrying(
+        index_of(args),
+        false,
+        2,
+        DEFAULT_TIMEOUT,
+        Duration::from_millis(1200),
+    )?;
+    let mut labels = Labels::load();
+    labels.set(&st.display_id, &code, &name);
+    let path = labels
+        .save()
+        .map_err(|e| DdcError::Protocol(e.to_string()))?;
+    println!("labelled {} on {} as {:?}", code, st.display_id, name);
+    println!("written to {}", path.display());
     Ok(())
 }
 
@@ -348,6 +428,8 @@ fn main() {
         "hold" => cmd_hold(rest),
         "bright" | "brightness" => cmd_bright(rest),
         "vcp" => cmd_vcp(rest),
+        "labels" => cmd_labels(rest),
+        "label" => cmd_label(rest),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())

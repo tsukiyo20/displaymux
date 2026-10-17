@@ -224,7 +224,9 @@ pub fn status(index: usize, caps: bool, timeout: Duration) -> Result<Status, Ddc
             s(&v, "error").unwrap_or_else(|| "helper reported failure".into()),
         ));
     }
-    Ok(Status::from_json(&v))
+    let mut st = Status::from_json(&v);
+    st.apply_labels(&crate::labels::Labels::load());
+    Ok(st)
 }
 
 /// One VCP code read back from the monitor.
@@ -273,6 +275,26 @@ pub fn read_vcps(index: usize, codes: &[u8], timeout: Duration) -> Result<Vec<Vc
         })
         .unwrap_or_default();
     Ok(reads)
+}
+
+impl Status {
+    /// Replace the MCCS port names with the user's labels, where supplied.
+    ///
+    /// The code is left alone -- it is still what gets sent to the monitor --
+    /// and only the human-readable name changes. Anything without a label keeps
+    /// its MCCS name.
+    pub fn apply_labels(&mut self, labels: &crate::labels::Labels) {
+        let display = self.display_id.clone();
+        for input in &mut self.inputs {
+            if let Some(name) = labels.get(&display, &input.code) {
+                input.name = name.to_string();
+            }
+        }
+        let current = self.current_input.clone();
+        if let Some(name) = current.and_then(|c| labels.get(&display, &c)) {
+            self.current_input_name = Some(name.to_string());
+        }
+    }
 }
 
 /// Outcome of asking a monitor to change input.
@@ -560,6 +582,7 @@ impl Reader {
             }
         }
         let mut st = Status::from_json(&v);
+        st.apply_labels(&crate::labels::Labels::load());
         // The reader reports an empty advertised set when it skipped caps; fill
         // from cache so the UI always has the real port list.
         if st.inputs.iter().all(|i| !i.advertised) {

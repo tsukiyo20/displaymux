@@ -206,6 +206,32 @@ leaves the user reaching for the monitor's buttons. So the tool stays a
 switcher; the only thing it reports is the outcome of the command you just asked
 for.
 
+### Naming the ports
+
+Because DDC cannot name the socket, you can. Labels live next to the app's other
+config and are per display:
+
+```bash
+dmux label 0x10 "Type-C - Mac"    # write one
+dmux labels                        # show the file and the resolved list
+```
+
+That writes `labels.json`, which is just a mapping:
+
+```json
+{
+  "R32U81": {
+    "0x0f": "DP - Windows",
+    "0x10": "Type-C - Mac"
+  }
+}
+```
+
+Keys are the display id from `dmux list`, then the VCP `0x60` value. Codes are
+compared in a canonical form, so `0x0F`, `0x0f` and `0xf` are the same key.
+Anything unlabelled keeps its MCCS name, so the file can be partial or missing
+entirely. Set `DMUX_LABELS` to point somewhere else.
+
 ## How it works
 
 ```

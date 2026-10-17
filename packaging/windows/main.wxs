@@ -32,13 +32,12 @@
             file there is not a reliable indicator that the component is
             installed for this user.
           -->
-          <Component Id="GuiBinary" Guid="*">
+          <Component Id="GuiBinary" Guid="E56EC083-0579-4AEA-98D2-98F3D89184E3">
             <File Id="GuiExe" Source="$(var.BinDir)\dmux-gui.exe">
               <Shortcut Id="StartMenuShortcut"
                         Directory="ProgramMenuDir"
                         Name="displaymux"
-                        WorkingDirectory="INSTALLDIR"
-                        Advertise="yes" />
+                        WorkingDirectory="INSTALLDIR" />
             </File>
             <RegistryValue Root="HKCU" Key="Software\tsukiyo20\displaymux"
                            Name="GuiExe" Type="integer" Value="1" KeyPath="yes" />
@@ -46,12 +45,12 @@
                  explicitly, and this component owns the directory. -->
             <RemoveFolder Id="RemoveInstallDir" On="uninstall" />
           </Component>
-          <Component Id="CliBinary" Guid="*">
+          <Component Id="CliBinary" Guid="1E0B7E32-1ED8-40A4-814A-02575C079A9F">
             <File Id="CliExe" Source="$(var.BinDir)\dmux.exe" />
             <RegistryValue Root="HKCU" Key="Software\tsukiyo20\displaymux"
                            Name="CliExe" Type="integer" Value="1" KeyPath="yes" />
           </Component>
-          <Component Id="HelperBinary" Guid="*">
+          <Component Id="HelperBinary" Guid="CBB348AA-2763-48A6-A071-D7268110DFFF">
             <File Id="HelperExe" Source="$(var.BinDir)\dmux-ddc-helper.exe" />
             <RegistryValue Root="HKCU" Key="Software\tsukiyo20\displaymux"
                            Name="HelperExe" Type="integer" Value="1" KeyPath="yes" />
@@ -66,7 +65,7 @@
 
     <!-- The Start Menu folder itself, plus the uninstall entry's metadata. -->
     <DirectoryRef Id="ProgramMenuDir">
-      <Component Id="StartMenuFolder" Guid="*">
+      <Component Id="StartMenuFolder" Guid="4251E3DF-4568-4560-8F95-86751FD19387">
         <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
         <RegistryValue Root="HKCU"
                        Key="Software\tsukiyo20\displaymux"

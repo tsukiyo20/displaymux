@@ -31,11 +31,8 @@ impl Settings {
 
     pub fn save(&self) -> std::io::Result<PathBuf> {
         let path = path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, text + "\n")?;
+        crate::config::write_atomic(&path, &(text + "\n"))?;
         Ok(path)
     }
 }

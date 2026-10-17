@@ -121,29 +121,38 @@ all show the same mark.
 
 ### A note on the GPUI dependency
 
-The GUI builds against GPUI 1.24 through the community release train
-`gpui-unofficial`, pinned with `=` because GPUI's minor version tracks Zed's
-release tags and carries no compatibility promise. Two features are load-bearing,
-and both live on `gpui_platform`:
+The GUI builds against [`gpui-kit`](https://github.com/longbridge/gpui-kit), which
+pins a matching family of `gpui-pre-*` crates and re-exports GPUI, `gpui-base`
+and `gpui-component` behind one dependency:
 
 ```toml
-gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.24.1-pre",
-                  default-features = false, features = [
-    "font-kit",         # without it macOS renders no text at all
-    "runtime_shaders",  # build without a full Xcode install
-] }
+gpui-kit = { version = "=0.7.3", default-features = false,
+             features = ["component", "assets"], optional = true }
 ```
 
-- **`font-kit`** belongs to GPUI's default feature set. Because we set
-  `default-features = false` (to reach `runtime_shaders`), it must be listed
-  explicitly. Omit it and the macOS backend falls back to `NoopTextSystem`:
-  layout, styling and font metrics all behave normally, and **not one glyph is
-  painted**. Zed hit the same trap in
+The version is pinned with `=` because gpui-kit pins its own `gpui-pre`
+snapshot exactly; letting the minor drift would mix two incompatible GPUI trees.
+
+Two features are load-bearing and gpui-kit already turns both on, but they are
+worth knowing about because they are invisible when missing:
+
+- **`font-kit`** belongs to GPUI's default feature set. Setting
+  `default-features = false` on a raw GPUI dependency drops it, and the macOS
+  backend then falls back to `NoopTextSystem`: layout, styling and font metrics
+  all behave normally and **not one glyph is painted**. Zed hit the same trap in
   [zed-industries/zed#59241](https://github.com/zed-industries/zed/pull/59241).
   A quick check: `cargo tree -e normal | grep -c font-kit` returning `0` is the bug.
 - **`runtime_shaders`** has GPUI compile its Metal shaders at run time. Without it
   the build calls `xcrun -sdk macosx metal`, which ships only with a full Xcode
   installation; with it, the Command Line Tools suffice.
+
+Windows must be opened through `gpui_kit::open_window`, not `App::open_window`.
+The helper wraps the view in `gpui_base::Root`; without that wrapper the app
+compiles and runs, but the window collapses to a minimum size instead of using
+the bounds it was given.
+
+The cost of the layer is real: the GUI binary is about 15 MB against 7 MB on raw
+GPUI. It is behind the `gui` feature, so the CLI and its DDC helper are unaffected.
 
 ## Command line
 

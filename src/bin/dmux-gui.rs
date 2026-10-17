@@ -71,9 +71,11 @@ fn main() {
 mod gui {
     use displaymux::ddc::{self, Status};
     use displaymux::tray::{Tray, TrayEvent};
-    use gpui::{
+    // `gpui_kit::*` is GPUI: the facade re-exports `gpui-pre` wholesale, so the
+    // element and app types come from the same place as before.
+    use gpui_kit::{
         div, prelude::*, px, rgb, size, App, Bounds, ClickEvent, Context, Global, IntoElement,
-        QuitMode, SharedString, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
+        QuitMode, SharedString, WeakEntity, Window, WindowBounds, WindowOptions,
     };
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -335,7 +337,7 @@ mod gui {
         code: String,
         name: String,
         advertised: bool,
-        app: gpui::WeakEntity<SwitchApp>,
+        app: gpui_kit::WeakEntity<SwitchApp>,
     ) -> impl IntoElement {
         let row_bg = rgb(0x26262e);
         let code_for_click = code.clone();
@@ -396,7 +398,7 @@ mod gui {
             let message = self.message.clone();
             let weak = cx.entity().downgrade();
 
-            let rows: Vec<gpui::AnyElement> = self
+            let rows: Vec<gpui_kit::AnyElement> = self
                 .status
                 .as_ref()
                 .map(|s| {
@@ -475,6 +477,9 @@ mod gui {
         /// The live view, while there is a window. `None` once the window has
         /// been closed, which the tray now survives.
         app: Option<WeakEntity<SwitchApp>>,
+        /// The window itself, so raising it does not depend on the root entity
+        /// type (`gpui_base::Root` once gpui-kit wraps the view).
+        window: Option<gpui_kit::AnyWindowHandle>,
     }
 
     impl Global for Installed {}
@@ -518,21 +523,23 @@ mod gui {
     }
 
     /// Open the main window and register its view with the tray.
-    fn open_main_window(cx: &mut App) -> Option<WindowHandle<SwitchApp>> {
-        let bounds = Bounds::centered(None, size(px(420.0), px(420.0)), cx);
-        let handle = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |_window, cx| cx.new(SwitchApp::new),
-            )
-            .ok()?;
-        // Give the tray the view it forwards to.
-        if let Ok(app) = handle.update(cx, |_, _, cx| cx.entity().downgrade()) {
-            cx.global_mut::<Installed>().app = Some(app);
-        }
+    fn open_main_window(cx: &mut App) -> Option<gpui_kit::AnyWindowHandle> {
+        let bounds = Bounds::centered(None, size(px(420.0), px(452.0)), cx);
+        // `gpui_kit::open_window` wraps our view in `gpui_base::Root`, which is
+        // what installs the theme and the dialog/notification layers. Opening
+        // the window through `App::open_window` instead compiles but leaves the
+        // tree without that root.
+        let (handle, view) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |_window, cx| cx.new(SwitchApp::new),
+        )
+        .ok()?;
+        cx.global_mut::<Installed>().app = Some(view.downgrade());
+        cx.global_mut::<Installed>().window = Some(handle);
         Some(handle)
     }
 
@@ -550,20 +557,21 @@ mod gui {
     ///   actually does the work on Windows.
     fn raise_main_window(cx: &mut App) {
         cx.activate(true);
-        let handle = cx
-            .windows()
-            .into_iter()
-            .find_map(|any| any.downcast::<SwitchApp>());
-        match handle {
-            Some(handle) => {
-                let _ = handle.update(cx, |_, window, _| window.activate_window());
-            }
-            // Closing the window does not quit (`QuitMode::Explicit`), so the
-            // tray has to be able to bring it back rather than leave "Show
-            // window" and a left click doing nothing at all.
-            None => {
-                open_main_window(cx);
-            }
+        // The stored handle is used rather than searching `cx.windows()`: with
+        // gpui-kit the window's root entity is `gpui_base::Root`, not
+        // `SwitchApp`, so a downcast on the view type would never match.
+        let handle = cx.global::<Installed>().window;
+        let raised = handle
+            .map(|h| {
+                h.update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        // Closing the window does not quit (`QuitMode::Explicit`), so the tray
+        // has to be able to bring it back rather than leave "Show window" and a
+        // left click doing nothing at all.
+        if !raised {
+            open_main_window(cx);
         }
     }
 
@@ -571,7 +579,10 @@ mod gui {
         // Modern entry point: the platform backends live in `gpui_platform`, and
         // the platform instance is now passed in explicitly rather than created
         // implicitly by `Application::new()`.
-        gpui_platform::application().run(|cx: &mut App| {
+        gpui_kit::application().run(|cx: &mut App| {
+            // Initialises the enabled gpui-kit layers (base, styled
+            // components, assets). Must run before any window is opened.
+            gpui_kit::init(cx);
             // The status item has to be created here: on macOS it needs the main
             // thread with an event loop already running, which is exactly what
             // the `run` closure provides. It goes in before the window so that
@@ -579,7 +590,11 @@ mod gui {
             let (events, clicks) = async_channel::unbounded();
             let tray = Tray::install(events);
             let installed = tray.is_some();
-            cx.set_global(Installed { tray, app: None });
+            cx.set_global(Installed {
+                tray,
+                app: None,
+                window: None,
+            });
             match installed {
                 // Without a tray there is nothing to bring the window back, so
                 // closing it has to mean quitting rather than leaving the app

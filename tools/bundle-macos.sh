@@ -6,6 +6,11 @@
 #   tools/bundle-macos.sh --install    also copy it to /Applications
 #   tools/bundle-macos.sh --dmg        also package -> target/release/dist/*.dmg
 #
+# Architecture:
+#   (no flag)                    build for the machine doing the build
+#   --target=aarch64-apple-darwin  build that target
+#   --universal                  build both targets and lipo them into one bundle
+#
 # The bundle carries all three binaries in Contents/MacOS. `dmux` looks for
 # `dmux-ddc-helper` next to its own executable, so keeping them together inside
 # the bundle is what lets the GUI spawn the DDC helper without any configuration.
@@ -25,23 +30,68 @@ contents="$app/Contents"
 
 install=false
 make_dmg=false
+universal=false
+target=""
 for arg in "$@"; do
     case "$arg" in
         --install) install=true ;;
         --dmg) make_dmg=true ;;
+        --universal) universal=true ;;
+        --target=*) target="${arg#--target=}" ;;
     esac
 done
 
+bins=(dmux dmux-ddc-helper dmux-gui)
+
+# Build one architecture into the cargo directory for it.
+build() {
+    local triple="$1"
+    if [[ -n "$triple" ]]; then
+        cargo build --release --features gui --target "$triple" --bin dmux \
+            --bin dmux-ddc-helper --bin dmux-gui
+    else
+        cargo build --release --features gui --bin dmux --bin dmux-ddc-helper --bin dmux-gui
+    fi
+}
+
 echo "building displaymux $version"
-cargo build --release --features gui \
-    --bin dmux --bin dmux-ddc-helper --bin dmux-gui
+if $universal; then
+    # Both halves are built and then fused. A universal bundle is the one
+    # artifact that runs on every Mac, which is what the updater publishes.
+    arch="universal"
+    bin_dir="$out/universal"
+    for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+        echo "  $triple"
+        build "$triple"
+    done
+    rm -rf "$bin_dir"
+    mkdir -p "$bin_dir"
+    for bin in "${bins[@]}"; do
+        lipo -create -output "$bin_dir/$bin" \
+            "target/aarch64-apple-darwin/release/$bin" \
+            "target/x86_64-apple-darwin/release/$bin"
+    done
+elif [[ -n "$target" ]]; then
+    case "$target" in
+        aarch64-*) arch="arm64" ;;
+        x86_64-*) arch="x86_64" ;;
+        *) arch="$target" ;;
+    esac
+    bin_dir="target/$target/release"
+    echo "  $target"
+    build "$target"
+else
+    [[ "$(uname -m)" == "arm64" ]] && arch="arm64" || arch="x86_64"
+    bin_dir="$out"
+    build ""
+fi
 
 echo "assembling $app"
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 
-for bin in dmux dmux-ddc-helper dmux-gui; do
-    cp "$out/$bin" "$contents/MacOS/$bin"
+for bin in "${bins[@]}"; do
+    cp "$bin_dir/$bin" "$contents/MacOS/$bin"
 done
 cp assets/icon.icns "$contents/Resources/icon.icns"
 
@@ -95,9 +145,8 @@ echo "built $app"
 # the .app out, and swaps it in. A zip would need a different code path, so the
 # release artifact is a .dmg.
 if $make_dmg; then
-    arch="$(uname -m)"
-    # The updater picks its asset by architecture, so the name has to carry it.
-    [[ "$arch" == "arm64" ]] && arch="arm64" || arch="x86_64"
+    # The updater picks its asset by architecture, and matches on *all* of its
+    # patterns, so the name is the only thing that says which build this is.
     dist="$out/dist"
     dmg="$dist/$app_name-$version-macos-$arch.dmg"
     mkdir -p "$dist"

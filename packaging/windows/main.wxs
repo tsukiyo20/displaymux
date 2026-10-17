@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user MSI: no elevation, installs under %LOCALAPPDATA%, which is where a
+  tool that talks to your monitor has any business living.
+
+  Built with the WiX 3 toolset:
+    candle.exe -dVersion= -dBinDir= -dIconPath= main.wxs
+    light.exe  -o ... main.wixobj
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="displaymux"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="tsukiyo20"
+           UpgradeCode="8d1b7c34-2f60-4a1e-9c55-0b7a4e6d3f21">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             Platform="x64" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of displaymux is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLDIR" Name="displaymux">
+          <Component Id="GuiBinary" Guid="*">
+            <File Id="GuiExe" Source="$(var.BinDir)\dmux-gui.exe" KeyPath="yes">
+              <Shortcut Id="StartMenuShortcut"
+                        Directory="ProgramMenuDir"
+                        Name="displaymux"
+                        WorkingDirectory="INSTALLDIR"
+                        Advertise="yes" />
+            </File>
+          </Component>
+          <Component Id="CliBinary" Guid="*">
+            <File Id="CliExe" Source="$(var.BinDir)\dmux.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="HelperBinary" Guid="*">
+            <File Id="HelperExe" Source="$(var.BinDir)\dmux-ddc-helper.exe" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="displaymux" />
+      </Directory>
+    </Directory>
+
+    <!-- The Start Menu folder itself, plus the uninstall entry's metadata. -->
+    <DirectoryRef Id="ProgramMenuDir">
+      <Component Id="StartMenuFolder" Guid="*">
+        <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\tsukiyo20\displaymux"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="displaymux" Level="1">
+      <ComponentRef Id="GuiBinary" />
+      <ComponentRef Id="CliBinary" />
+      <ComponentRef Id="HelperBinary" />
+      <ComponentRef Id="StartMenuFolder" />
+    </Feature>
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/tsukiyo20/displaymux" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+  </Product>
+</Wix>

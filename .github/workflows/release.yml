@@ -3,10 +3,12 @@ name: release
 # Publishing is a tag push. Everything the updater reads -- the release, its
 # assets, and the checksums it verifies them against -- is produced here, so
 # there is no update server and no feed file that can fall out of date.
+#
+# `workflow_dispatch` runs the same jobs but stops before publishing, which is
+# how the packaging gets exercised without cutting a release.
 on:
   push:
     tags: ["v*"]
-  # Lets the packaging be exercised without publishing anything.
   workflow_dispatch:
 
 permissions:
@@ -16,45 +18,66 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      - run: cargo test --release
+
   macos:
+    needs: test
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        # Three artifacts. The universal one is what the updater installs -- it
+        # runs on either architecture -- and the per-architecture ones are
+        # smaller downloads for anyone installing by hand.
+        include:
+          - name: arm64
+            flags: --target=aarch64-apple-darwin
+          - name: x86_64
+            flags: --target=x86_64-apple-darwin
+          - name: universal
+            flags: --universal
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos
+          key: macos-${{ matrix.name }}
 
-      - name: Test
-        run: cargo test --release
-
-      # Builds the .app, signs it ad-hoc, and packages the disk image the
-      # updater installs from. The volume name and layout match what a person
-      # dragging the app to /Applications expects, because they get the same
-      # file.
+      # Ad-hoc signed, not notarised: the README covers the one-time
+      # `xattr -dr com.apple.quarantine` that first launch needs.
       - name: Bundle and package
-        run: ./tools/bundle-macos.sh --dmg
+        run: ./tools/bundle-macos.sh --dmg ${{ matrix.flags }}
 
-      # The updater asks for SHA256SUMS and refuses a download it cannot check.
-      # It covers the artifacts the app installs, which is the macOS image; the
-      # Windows zip is a manual download and is deliberately not advertised as
-      # covered by a file that does not mention it.
-      - name: Checksums
-        run: |
-          cd target/release/dist
-          shasum -a 256 ./*.dmg | sed 's|  .*/|  |' > SHA256SUMS
-          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.name }}
+          path: target/release/dist/*.dmg
+          if-no-files-found: error
 
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: |
-            target/release/dist/*.dmg
-            target/release/dist/SHA256SUMS
+          files: target/release/dist/*.dmg
           fail_on_unmatched_files: true
 
   windows:
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,26 +88,101 @@ jobs:
         with:
           key: windows
 
-      - name: Test
-        run: cargo test --release
-
       - name: Build
         run: cargo build --release --features gui --bins
 
-      # A zip, not an installer: the app ships two executables and the updater's
-      # Windows path replaces the running one, which would leave the DDC helper
-      # behind. Until there is an installer to hand to msiexec, Windows updates
-      # are a manual unzip.
-      - name: Package
+      - name: Version
+        id: version
         shell: pwsh
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          $stage = "displaymux-$version-windows-x86_64"
-          New-Item -ItemType Directory -Path $stage | Out-Null
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "value=$v" >> $env:GITHUB_OUTPUT
+
+      # The app ships three executables and the updater replaces only the
+      # running one, so a plain zip stays the honest no-installer fallback.
+      - name: Zip
+        shell: pwsh
+        run: |
+          $stage = "dist/displaymux-${{ steps.version.outputs.value }}-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/dmux.exe, target/release/dmux-gui.exe, target/release/dmux-ddc-helper.exe $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
 
-      - uses: softprops/action-gh-release@v2
+      - name: NSIS installer
+        shell: pwsh
+        run: |
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            choco install nsis --no-progress -y
+          }
+          if (-not (Test-Path $makensis)) {
+            throw "makensis.exe not found"
+          }
+          $out = "dist/displaymux-${{ steps.version.outputs.value }}-windows-x86_64-setup.exe"
+          & $makensis /DVERSION=${{ steps.version.outputs.value }} /DBINDIR=target\release /DOUTFILE=$out packaging/windows/installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+
+      - name: MSI installer
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $wix) { throw "WiX toolset not found" }
+          $bin = Join-Path $wix.FullName "bin"
+          $obj = "dist/wixobj"
+          New-Item -ItemType Directory -Force -Path $obj | Out-Null
+
+          & (Join-Path $bin "candle.exe") -nologo `
+            -dVersion=${{ steps.version.outputs.value }} `
+            -dBinDir="${{ github.workspace }}\target\release" `
+            -dIconPath="${{ github.workspace }}\assets\icon.ico" `
+            -out "$obj\main.wixobj" `
+            packaging/windows/main.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+
+          & (Join-Path $bin "light.exe") -nologo `
+            -out "dist/displaymux-${{ steps.version.outputs.value }}-windows-x86_64.msi" `
+            "$obj\main.wixobj"
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: displaymux-*-windows-x86_64.zip
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.msi
+            dist/*-setup.exe
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/*.zip
+            dist/*.msi
+            dist/*-setup.exe
           fail_on_unmatched_files: true
+
+  # The updater asks for SHA256SUMS and refuses a download it cannot check, so
+  # this runs last, over everything that was published. Doing it in one place
+  # is the only way the file can list every asset: the packaging jobs finish in
+  # an order nobody controls.
+  checksums:
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p assets
+          gh release download "$tag" --dir assets --pattern '*.dmg' --pattern '*.zip' --pattern '*.msi' --pattern '*-setup.exe'
+          cd assets
+          sha256sum ./* | sed 's|  \./|  |' > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$tag" SHA256SUMS --clobber

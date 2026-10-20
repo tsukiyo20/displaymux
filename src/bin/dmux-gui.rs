@@ -119,7 +119,8 @@ mod gui {
     }
 
     enum Response {
-        Status(Box<Result<Status, String>>),
+        /// Every display that could be listed, in system order.
+        Statuses(Box<Result<Vec<Status>, String>>),
         Switched(Box<Result<SwitchNote, String>>),
     }
 
@@ -150,28 +151,45 @@ mod gui {
                                 // the worker, after which the UI waited on a
                                 // channel nobody would ever answer and sat on
                                 // "working..." forever.
-                                let out = match ddc::Reader::spawn() {
-                                    Err(e) if reader.is_none() => Err(e.to_string()),
-                                    _ => {
-                                        if reader.is_none() {
-                                            reader = ddc::Reader::spawn().ok();
-                                        }
-                                        match reader.as_mut() {
-                                            None => Err("DDC reader unavailable".to_string()),
-                                            Some(r) => match r.status(0, READ_TIMEOUT) {
-                                                Ok(st) => Ok(st),
-                                                Err(e) => {
-                                                    // Drop it: the next request builds
-                                                    // a fresh IOAVService, the only
-                                                    // way to recover a wedged channel.
-                                                    reader = None;
-                                                    Err(e.to_string())
+                                let out = match ddc::list_displays(READ_TIMEOUT) {
+                                    Err(e) => Err(e.to_string()),
+                                    Ok(list) if list.is_empty() => Ok(Vec::new()),
+                                    Ok(list) => {
+                                        let mut statuses = Vec::with_capacity(list.len());
+                                        for display in list {
+                                            if reader.is_none() {
+                                                reader = ddc::Reader::spawn().ok();
+                                            }
+                                            let read = match reader.as_mut() {
+                                                Some(r) => r.status(display.index, READ_TIMEOUT),
+                                                None => {
+                                                    statuses.push(Status::unreadable(
+                                                        display.index,
+                                                        display.id.clone(),
+                                                        "DDC reader unavailable".to_string(),
+                                                    ));
+                                                    continue;
                                                 }
-                                            },
+                                            };
+                                            match read {
+                                                Ok(status) => statuses.push(status),
+                                                Err(e) => {
+                                                    // The channel may be wedged for this
+                                                    // display only; start a fresh
+                                                    // connection for the next one.
+                                                    reader = None;
+                                                    statuses.push(Status::unreadable(
+                                                        display.index,
+                                                        display.id.clone(),
+                                                        e.to_string(),
+                                                    ));
+                                                }
+                                            }
                                         }
+                                        Ok(statuses)
                                     }
                                 };
-                                if res_tx.send(Response::Status(Box::new(out))).is_err() {
+                                if res_tx.send(Response::Statuses(Box::new(out))).is_err() {
                                     break;
                                 }
                             }
@@ -205,10 +223,14 @@ mod gui {
 
     struct SwitchApp {
         worker: Worker,
-        status: Option<Status>,
+        /// Every display the last read found, in system order.
+        displays: Vec<Status>,
         message: SharedString,
         busy: bool,
-        index: usize,
+        /// Requests sent and not yet answered.
+        pending: usize,
+        /// Which entry of `displays` the window is showing.
+        selected: usize,
         /// The target of an in-flight switch, remembered once it is accepted.
         pending_input: Option<String>,
         settings: Settings,
@@ -237,10 +259,11 @@ mod gui {
             let settings_theme = settings.theme.clone();
             let app = SwitchApp {
                 worker,
-                status: None,
+                displays: Vec::new(),
                 message: t!("reading").into(),
                 busy: false,
-                index: 0,
+                pending: 0,
+                selected: 0,
                 pending_input: None,
                 settings,
                 editing: None,
@@ -307,22 +330,20 @@ mod gui {
                 return;
             };
             tray.set_update(available.as_deref());
-            let display = self
-                .status
-                .as_ref()
-                .map(|s| s.display_id.clone())
-                .unwrap_or_else(|| t!("no_monitor").to_string());
-            let inputs: Vec<(String, String)> = self
-                .status
-                .as_ref()
-                .map(|s| {
-                    s.inputs
+            let groups: Vec<displaymux::tray::DisplayMenu> = self
+                .displays
+                .iter()
+                .map(|display| displaymux::tray::DisplayMenu {
+                    index: display.display_index,
+                    name: display.display_id.clone(),
+                    ports: display
+                        .inputs
                         .iter()
                         .map(|i| (i.code.clone(), i.name.clone()))
-                        .collect()
+                        .collect(),
                 })
-                .unwrap_or_default();
-            tray.update(&display, &inputs);
+                .collect();
+            tray.update(&groups);
         }
 
         /// Act on the tray clicks that need this view.
@@ -337,10 +358,15 @@ mod gui {
                 // command, so it gets the same confirmation rather than firing
                 // straight from a menu click.
                 TrayEvent::CheckUpdates => self.open_update(cx),
-                TrayEvent::Switch(code) => {
+                TrayEvent::Switch { index, code } => {
                     let p = self.palette();
-                    let name = self.input_name(&code);
-                    open_confirm(cx, p, code, name);
+                    let target = SwitchTarget {
+                        display_index: index,
+                        display: self.display_name(index),
+                        name: self.port_name(index, &code),
+                        code,
+                    };
+                    open_confirm(cx, p, target);
                 }
                 TrayEvent::Show | TrayEvent::Quit => {}
             }
@@ -348,30 +374,41 @@ mod gui {
 
         /// Poll the worker's response channel on a timer, so the UI thread never
         /// blocks on DDC. This is the bridge to the worker thread.
+        /// Drain the worker's answers, forever.
+        ///
+        /// One loop for the life of the view, rather than one per request: with
+        /// several displays a read can take seconds, and the old
+        /// request-per-poller design could only ever have one in flight -- it
+        /// refused the next one instead of queueing it, so a switch made while a
+        /// read was running was silently dropped.
         fn poll(&self, cx: &mut Context<Self>) {
             let rx = self.worker.rx.clone();
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(POLL_INTERVAL).await;
-                    let got = rx.lock().ok().map(|r| r.try_recv());
-                    match got {
-                        Some(Ok(resp)) => {
-                            let _ = this.update(cx, |app, cx| {
-                                app.apply(resp, cx);
-                                cx.notify();
-                            });
-                            break;
-                        }
-                        Some(Err(std::sync::mpsc::TryRecvError::Empty)) => continue,
-                        // The worker died without answering. Clear `busy` so the
-                        // UI does not sit on "working..." forever.
-                        _ => {
-                            let _ = this.update(cx, |app, cx| {
-                                app.busy = false;
-                                app.message = "DDC worker stopped unexpectedly".into();
-                                cx.notify();
-                            });
-                            break;
+                    // Take everything that has arrived before waiting again.
+                    loop {
+                        let got = rx.lock().ok().map(|r| r.try_recv());
+                        match got {
+                            Some(Ok(resp)) => {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.apply(resp, cx);
+                                    cx.notify();
+                                });
+                            }
+                            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => break,
+                            // The worker died without answering. Clear the
+                            // pending count so the UI does not sit on
+                            // "working..." forever.
+                            _ => {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.pending = 0;
+                                    app.busy = false;
+                                    app.message = "DDC worker stopped unexpectedly".into();
+                                    cx.notify();
+                                });
+                                return;
+                            }
                         }
                     }
                 }
@@ -380,37 +417,41 @@ mod gui {
         }
 
         fn apply(&mut self, resp: Response, cx: &mut Context<Self>) {
-            self.busy = false;
+            self.pending = self.pending.saturating_sub(1);
+            self.busy = self.pending > 0;
             match resp {
-                Response::Status(st) => match *st {
-                    Ok(s) => {
+                Response::Statuses(list) => match *list {
+                    Ok(list) => {
+                        // Keep the display the window was showing across a
+                        // refresh; the indices are the system's, and a display
+                        // waking up can renumber them.
+                        let showing = self.selected_display().map(|s| s.display_index);
+                        self.displays = list;
+                        self.selected = showing
+                            .and_then(|index| {
+                                self.displays.iter().position(|s| s.display_index == index)
+                            })
+                            .unwrap_or(0);
                         // Report only what we can stand behind. The monitor's
                         // VCP 0x60 value is not shown as "current input" because
                         // on the reference monitor it is a constant that does not
-                        // follow the actual input; the honest state comes from
-                        // the USB-based banner above.
+                        // follow the actual input.
                         // Only speak when there is something to say. A list of
                         // ports is its own explanation.
-                        self.message = if s.inputs.is_empty() {
-                            t!("no_inputs").into()
-                        } else {
-                            String::new().into()
+                        self.message = match self.selected_display() {
+                            Some(s) if s.inputs.is_empty() => t!("no_inputs").into(),
+                            Some(_) => String::new().into(),
+                            None => t!("no_monitor").into(),
                         };
-                        if !s.inputs.is_empty() {
-                            self.index = s.display_index;
-                        }
-                        self.status = Some(s);
                         // Once the window has something to show, look for a
                         // newer release. Once per launch: a check on every
                         // refresh would be noise, and the menu bar can re-run it.
-                        if !self.update_checked {
+                        if !self.update_checked && !self.displays.is_empty() {
                             self.update_checked = true;
                             self.check_updates(cx);
                         }
                     }
-                    Err(e) => {
-                        self.message = t!("read_failed", error = e.to_string().as_str()).into()
-                    }
+                    Err(e) => self.message = t!("read_failed", error = e.as_str()).into(),
                 },
                 Response::Switched(r) => {
                     match *r {
@@ -436,13 +477,12 @@ mod gui {
         }
 
         fn send(&mut self, req: Request, note: impl Into<SharedString>, cx: &mut Context<Self>) {
-            if self.busy {
-                return;
-            }
+            // Queued, never refused: the worker applies requests one at a time,
+            // so there is nothing here that a busy moment needs to protect.
+            self.pending += 1;
             self.busy = true;
             self.message = note.into();
             let _ = self.worker.tx.send(req);
-            self.poll(cx);
             cx.notify();
         }
     }
@@ -628,9 +668,18 @@ mod gui {
                     .on_click(move |_e: &ClickEvent, _window: &mut Window, cx: &mut App| {
                         let code = code.clone();
                         let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                            let Some(display) = app.selected_display() else {
+                                return;
+                            };
+                            let index = display.display_index;
                             let p = app.palette();
-                            let name = app.input_name(&code);
-                            open_confirm(cx, p, code, name);
+                            let target = SwitchTarget {
+                                display_index: index,
+                                display: app.display_name(index),
+                                name: app.port_name(index, &code),
+                                code,
+                            };
+                            open_confirm(cx, p, target);
                         });
                     })
             })
@@ -676,10 +725,18 @@ mod gui {
     /// It is its own view because the countdown changes every second and a
     /// window's content is built once; it also owns the auto-fire, so "clicked
     /// Switch" and "ran out" take exactly the same path.
-    struct ConfirmView {
-        p: Palette,
+    /// What a confirmation is about: one port on one display.
+    #[derive(Clone)]
+    struct SwitchTarget {
+        display_index: usize,
+        display: String,
         code: String,
         name: String,
+    }
+
+    struct ConfirmView {
+        p: Palette,
+        target: SwitchTarget,
         left: u8,
         /// `None` once the main window is closed: the menu bar can still switch,
         /// it just has nowhere to report to.
@@ -693,11 +750,16 @@ mod gui {
     /// time it is answered -- the main window may have closed in between. The
     /// update has to be *checked*, not assumed: swallowing its error is how the
     /// menu bar came to confirm a switch and then do nothing.
-    fn dispatch_switch(app: Option<WeakEntity<SwitchApp>>, code: String, cx: &mut App) {
+    fn dispatch_switch(
+        app: Option<WeakEntity<SwitchApp>>,
+        index: usize,
+        code: String,
+        cx: &mut App,
+    ) {
         if let Some(app) = app {
             if app
                 .update(cx, |app: &mut SwitchApp, cx| {
-                    app.fire_switch(code.clone(), cx)
+                    app.fire_switch(index, code.clone(), cx)
                 })
                 .is_ok()
             {
@@ -707,7 +769,7 @@ mod gui {
         // Nothing to drive it, so ask the monitor directly -- one shot, like
         // every other write.
         cx.background_spawn(async move {
-            let _ = displaymux::ddc::set_input(0, &code, Duration::from_secs(12));
+            let _ = displaymux::ddc::set_input(index, &code, Duration::from_secs(12));
         })
         .detach();
     }
@@ -715,8 +777,7 @@ mod gui {
     impl ConfirmView {
         fn new(
             p: Palette,
-            code: String,
-            name: String,
+            target: SwitchTarget,
             app: Option<WeakEntity<SwitchApp>>,
             window: Option<gpui_kit::AnyWindowHandle>,
             cx: &mut Context<Self>,
@@ -741,10 +802,11 @@ mod gui {
                     }
                 }
                 let _ = this.update(cx, |view, cx| {
-                    let code = view.code.clone();
+                    let code = view.target.code.clone();
+                    let index = view.target.display_index;
                     let app = view.app.clone();
                     let window = view.window;
-                    dispatch_switch(app, code, cx);
+                    dispatch_switch(app, index, code, cx);
                     if let Some(window) = window {
                         let _ = window.update(cx, |_, window, cx| ConfirmView::dismiss(window, cx));
                     }
@@ -754,8 +816,7 @@ mod gui {
 
             Self {
                 p,
-                code,
-                name,
+                target,
                 left: CONFIRM_SECONDS,
                 app,
                 window,
@@ -775,8 +836,7 @@ mod gui {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let p = self.p;
             let left = self.left;
-            let code = self.code.clone();
-            let name = self.name.clone();
+            let target = self.target.clone();
             let app = self.app.clone();
 
             div()
@@ -820,9 +880,14 @@ mod gui {
                         .p(px(16.0))
                         .gap_2()
                         .child(
-                            div()
-                                .text_sm()
-                                .child(t!("confirm_body", name = name.as_str()).to_string()),
+                            div().text_sm().child(
+                                t!(
+                                    "confirm_body",
+                                    display = target.display.as_str(),
+                                    name = target.name.as_str()
+                                )
+                                .to_string(),
+                            ),
                         )
                         .child(
                             div()
@@ -877,7 +942,12 @@ mod gui {
                                 .child(t!("confirm_switch", count = left))
                                 .on_click(
                                     move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                        dispatch_switch(app.clone(), code.clone(), cx);
+                                        dispatch_switch(
+                                            app.clone(),
+                                            target.display_index,
+                                            target.code.clone(),
+                                            cx,
+                                        );
                                         ConfirmView::dismiss(window, cx);
                                     },
                                 )
@@ -1190,7 +1260,7 @@ mod gui {
     ///
     /// Shared by both entrances -- the Switch button and the menu bar -- so
     /// there is one confirmation to learn rather than two.
-    fn open_confirm(cx: &mut App, p: Palette, code: String, name: String) {
+    fn open_confirm(cx: &mut App, p: Palette, target: SwitchTarget) {
         // One at a time: a second tray click should not stack windows. The
         // handle is cleared by `ConfirmView::dismiss`, because a closed window's
         // handle does not reliably report itself as gone.
@@ -1213,12 +1283,11 @@ mod gui {
             },
             cx,
             move |_window, cx| {
-                let code = code.clone();
-                let name = name.clone();
+                let target = target.clone();
                 let app = app.clone();
                 cx.new(move |cx| {
                     let window = cx.active_window();
-                    ConfirmView::new(p, code, name, app, window, cx)
+                    ConfirmView::new(p, target, app, window, cx)
                 })
             },
         );
@@ -1228,11 +1297,27 @@ mod gui {
     }
 
     impl SwitchApp {
+        /// The display the window is showing.
+        fn selected_display(&self) -> Option<&Status> {
+            self.displays.get(self.selected)
+        }
+
+        /// A display by the index the system gave it.
+        fn display_by_index(&self, index: usize) -> Option<&Status> {
+            self.displays.iter().find(|d| d.display_index == index)
+        }
+
+        /// What to call a display in a sentence.
+        fn display_name(&self, index: usize) -> String {
+            self.display_by_index(index)
+                .map(|d| d.display_id.clone())
+                .unwrap_or_else(|| t!("no_monitor").to_string())
+        }
+
         /// How a port is named in a confirmation: its label, then its code.
-        fn input_name(&self, code: &str) -> String {
-            self.status
-                .as_ref()
-                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
+        fn port_name(&self, index: usize, code: &str) -> String {
+            self.display_by_index(index)
+                .and_then(|d| d.inputs.iter().find(|i| i.code == code))
                 .map(|i| format!("{} ({})", i.name, i.code))
                 .unwrap_or_else(|| code.to_string())
         }
@@ -1280,10 +1365,10 @@ mod gui {
         }
 
         /// Send the switch the dialog was opened for.
-        fn fire_switch(&mut self, code: String, cx: &mut Context<Self>) {
+        fn fire_switch(&mut self, index: usize, code: String, cx: &mut Context<Self>) {
             self.send(
                 Request::Switch {
-                    index: self.index,
+                    index,
                     code: code.clone(),
                 },
                 t!("switching_to", code = code.as_str()),
@@ -1298,9 +1383,8 @@ mod gui {
         /// once, and creating the state inside it would reset the text.
         fn open_edit_dialog(&mut self, code: String, window: &mut Window, cx: &mut Context<Self>) {
             let current = self
-                .status
-                .as_ref()
-                .and_then(|s| s.inputs.iter().find(|i| i.code == code))
+                .selected_display()
+                .and_then(|d| d.inputs.iter().find(|i| i.code == code))
                 .map(|i| i.name.clone())
                 .unwrap_or_default();
             let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
@@ -1384,7 +1468,7 @@ mod gui {
             let Some((_, editor)) = self.editing.take() else {
                 return;
             };
-            let Some(display) = self.status.as_ref().map(|s| s.display_id.clone()) else {
+            let Some(display) = self.selected_display().map(|d| d.display_id.clone()) else {
                 return;
             };
             let text = editor.read(cx).value().trim().to_string();
@@ -1665,14 +1749,24 @@ mod gui {
             let weak = cx.entity().downgrade();
             let busy = self.busy;
             let message = self.message.clone();
-            let display = self
-                .status
-                .as_ref()
-                .map(|s| s.display_id.clone())
-                .unwrap_or_else(|| t!("no_monitor").to_string());
+            // One entry per display the last read found, so the header can
+            // offer them as a selector instead of naming one.
+            let choices: Vec<(usize, usize, String)> = self
+                .displays
+                .iter()
+                .enumerate()
+                .map(|(position, d)| (position, d.display_index, d.display_id.clone()))
+                .collect();
+            let showing = self.selected_display().map(|d| d.display_index);
+            // A display can still be listed while its DDC channel is silent --
+            // typically because it is showing another computer. Saying so is the
+            // difference between "this is expected" and "the button is broken".
+            let unreachable = self
+                .selected_display()
+                .and_then(|d| d.read_error.as_ref())
+                .map(|e| (e.clone(), t!("display_unreachable").to_string()));
             let rows: Vec<gpui_kit::AnyElement> = self
-                .status
-                .as_ref()
+                .selected_display()
                 .map(|s| {
                     s.inputs
                         .iter()
@@ -1703,7 +1797,66 @@ mod gui {
                         .px(px(14.0))
                         .pt(px(12.0))
                         .pb(px(8.0))
-                        .child(div().text_xs().text_color(rgb(p.text_faint)).child(display))
+                        .child({
+                            let weak = weak.clone();
+                            // One display: a label. More than one: a selector,
+                            // because the window can only show one at a time.
+                            if choices.len() < 2 {
+                                let name = choices
+                                    .first()
+                                    .map(|(_, _, id)| id.clone())
+                                    .unwrap_or_else(|| t!("no_monitor").to_string());
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.text_faint))
+                                    .child(name)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .children(choices.iter().map(|(position, index, id)| {
+                                        let position = *position;
+                                        let index = *index;
+                                        let selected = showing == Some(index);
+                                        let weak = weak.clone();
+                                        div()
+                                            .id(SharedString::from(format!("pick-{index}")))
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .bg(if selected {
+                                                rgb(p.surface_active)
+                                            } else {
+                                                rgb(p.surface)
+                                            })
+                                            .text_xs()
+                                            .text_color(if selected {
+                                                rgb(p.text)
+                                            } else {
+                                                rgb(p.text_faint)
+                                            })
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(p.surface_active)))
+                                            .child(id.clone())
+                                            .on_click(
+                                                move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                                    let _ = weak.update(
+                                                        cx,
+                                                        |app: &mut SwitchApp, cx| {
+                                                            app.selected = position;
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                },
+                                            )
+                                            .into_any_element()
+                                    }))
+                                    .into_any_element()
+                            }
+                        })
                         .child(if busy {
                             div()
                                 .text_xs()
@@ -1734,6 +1887,33 @@ mod gui {
                                 .into_any_element()
                         }),
                 )
+                .when_some(unreachable, |d, (error, explanation)| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .mx(px(14.0))
+                            .mb(px(8.0))
+                            .p(px(9.0))
+                            .rounded_md()
+                            .bg(rgb(p.surface))
+                            .border_1()
+                            .border_color(rgb(p.hairline))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.accent))
+                                    .child(explanation),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.text_faint))
+                                    .child(error),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -1828,8 +2008,8 @@ mod gui {
                     TrayEvent::Show => cx.update(raise_main_window),
                     // The rest is about the display, so it needs a view to act on.
                     TrayEvent::Refresh => cx.update(|cx| forward_to_view(cx, TrayEvent::Refresh)),
-                    TrayEvent::Switch(code) => {
-                        cx.update(|cx| forward_to_view(cx, TrayEvent::Switch(code)))
+                    TrayEvent::Switch { index, code } => {
+                        cx.update(|cx| forward_to_view(cx, TrayEvent::Switch { index, code }))
                     }
                     TrayEvent::CheckUpdates => {
                         cx.update(|cx| forward_to_view(cx, TrayEvent::CheckUpdates))
@@ -1868,7 +2048,7 @@ mod gui {
             let app = cx.global::<Installed>().app.clone();
             open_update_window(cx, if dark { DARK } else { LIGHT }, None, app);
         }
-        if let TrayEvent::Switch(code) = event {
+        if let TrayEvent::Switch { index, code } = event {
             let choice = ThemeChoice::from_setting(Settings::load().theme.as_deref());
             let dark = match choice {
                 ThemeChoice::Dark => true,
@@ -1878,7 +2058,18 @@ mod gui {
                     WindowAppearance::Dark | WindowAppearance::VibrantDark
                 ),
             };
-            open_confirm(cx, if dark { DARK } else { LIGHT }, code.clone(), code);
+            // No window, so no labels: the port code stands in for its name and
+            // the display is named by index.
+            open_confirm(
+                cx,
+                if dark { DARK } else { LIGHT },
+                SwitchTarget {
+                    display_index: index,
+                    display: format!("display {}", index + 1),
+                    name: code.clone(),
+                    code,
+                },
+            );
         }
     }
 

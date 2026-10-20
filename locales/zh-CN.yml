@@ -13,7 +13,7 @@ theme_dark: 深色
 theme_light: 浅色
 theme_system: 跟随系统
 confirm_title: "切换输入源"
-confirm_body: "把这块显示器切换到 %{name}？"
+confirm_body: "把 %{display} 切换到 %{name}？"
 confirm_note: "画面，以及接在显示器 hub 上的设备，都会转到那台电脑。"
 confirm_switch: "切换（%{count}）"
 edit_label: "端口标签"
@@ -21,6 +21,7 @@ switch: 切换
 save: 保存
 cancel: 取消
 
+display_unreachable: "这台显示器没有响应 DDC，很可能正在显示别的信号源。切换有时仍然有效；否则请在显示器上手动切回，或在那台电脑上运行 displaymux。"
 update_title: 更新
 update_checking: "正在检查更新…"
 update_latest: 已是最新版本

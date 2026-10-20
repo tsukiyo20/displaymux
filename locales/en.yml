@@ -14,7 +14,7 @@ theme_dark: Dark
 theme_light: Light
 theme_system: System
 confirm_title: "Switch input"
-confirm_body: "Switch this display to %{name}?"
+confirm_body: "Switch %{display} to %{name}?"
 confirm_note: "The screen, and anything plugged into the monitor's hub, moves to that computer."
 confirm_switch: "Switch (%{count})"
 edit_label: "Port label"
@@ -22,6 +22,7 @@ switch: Switch
 save: Save
 cancel: Cancel
 
+display_unreachable: "no DDC reply - this display is probably showing another source. Switching may still work; otherwise switch it on the monitor itself, or run displaymux on the other computer."
 update_title: Update
 update_checking: "checking for updates..."
 update_latest: "up to date"

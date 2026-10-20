@@ -167,6 +167,24 @@ pub struct Status {
 }
 
 impl Status {
+    /// A display that was listed but could not be read.
+    ///
+    /// One unreadable display must not empty the window: with two monitors,
+    /// saying nothing at all about either is the worst answer.
+    pub fn unreadable(index: usize, id: impl Into<String>, error: String) -> Status {
+        Status {
+            display_index: index,
+            display_id: id.into(),
+            current_input: None,
+            current_input_name: None,
+            inputs: Vec::new(),
+            caps_raw: None,
+            read_error: Some(error),
+            caps_error: None,
+            elapsed_ms: 0,
+        }
+    }
+
     fn from_json(v: &Value) -> Status {
         let idx = v
             .get("display")

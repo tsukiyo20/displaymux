@@ -23,8 +23,11 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 /// A click on one of our menu rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayEvent {
-    /// Switch this display to the given VCP 0x60 value, e.g. "0x11".
-    Switch(String),
+    /// Switch display `index` to the given VCP 0x60 value, e.g. "0x11".
+    Switch {
+        index: usize,
+        code: String,
+    },
     /// Re-read the monitor and rebuild the menu.
     Refresh,
     /// Show the main window.
@@ -36,6 +39,7 @@ pub enum TrayEvent {
 
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_SWITCH_PREFIX: &str = "input:";
+const ID_DISPLAY_PREFIX: &str = "display:";
 const ID_REFRESH: &str = "refresh";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
@@ -134,6 +138,13 @@ fn mux_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, BITMAP_PX, BITMAP_PX).expect("icon buffer is well formed")
 }
 
+/// One display's block in the menu: its heading and the ports beneath it.
+pub struct DisplayMenu {
+    pub index: usize,
+    pub name: String,
+    pub ports: Vec<(String, String)>,
+}
+
 /// The live menu bar item plus the rows that get rewritten on refresh.
 pub struct Tray {
     /// Held so the status item stays alive; dropping it removes the icon.
@@ -142,8 +153,11 @@ pub struct Tray {
     show: MenuItem,
     /// "Check for updates", or "install %version" once one is waiting.
     update: MenuItem,
-    /// Input rows, rebuilt whenever the advertised list changes.
-    rows: Vec<(String, MenuItem)>,
+    /// The rows below the fixed entries -- a heading per display and its ports.
+    /// Rebuilt whenever the set of displays or ports changes.
+    rows: Vec<MenuItem>,
+    /// What the disabled first row currently says, so a rebuild can be skipped.
+    heading_text: String,
     menu: Menu,
 }
 
@@ -201,6 +215,7 @@ impl Tray {
             header,
             show,
             update,
+            heading_text: String::new(),
             rows: Vec::new(),
             menu,
         })
@@ -227,40 +242,75 @@ impl Tray {
         });
     }
 
-    pub fn update(&mut self, display: &str, inputs: &[(String, String)]) {
-        self.header.set_text(display);
+    /// Rebuild the per-display block: one heading per display, its ports beneath.
+    ///
+    /// The block is rebuilt whenever the set of displays or ports changes, and
+    /// only the labels are rewritten otherwise, so an open menu does not
+    /// flicker.
+    pub fn update(&mut self, displays: &[DisplayMenu]) {
         self.show.set_text(t!("tray_show"));
 
-        // Rebuild the input rows only when the set of ports changed; keeping the
-        // rows stable avoids flicker in the open menu.
-        let same = self.rows.len() == inputs.len()
-            && self
-                .rows
-                .iter()
-                .zip(inputs)
-                .all(|((code, _), (want, _))| code == want);
-        if !same {
-            for (_, row) in self.rows.drain(..) {
-                let _ = self.menu.remove(&row);
-            }
-            for (code, name) in inputs {
-                let row = MenuItem::with_id(format!("{ID_SWITCH_PREFIX}{code}"), name, true, None);
-                // The trailing block is [separator, show, quit]; put the port
-                // rows above it.
-                let at = self.menu.items().len().saturating_sub(3);
-                if let Err(e) = self.menu.insert(&row, at) {
-                    eprintln!("tray: cannot insert {code}: {e}");
-                    continue;
+        let same = self.rows.len() == displays.iter().map(|d| d.ports.len() + 1).sum::<usize>()
+            && self.heading_text == heading(displays);
+        if same {
+            // Same shape: only the labels can have moved.
+            let mut rows = self.rows.iter();
+            for display in displays {
+                if let Some(row) = rows.next() {
+                    row.set_text(display.name.clone());
                 }
-                self.rows.push((code.clone(), row));
+                for (_, name) in &display.ports {
+                    if let Some(row) = rows.next() {
+                        row.set_text(name.clone());
+                    }
+                }
             }
             return;
         }
 
-        // Same ports, so only the labels can have moved.
-        for ((_, row), (_, name)) in self.rows.iter().zip(inputs) {
-            row.set_text(name);
+        for row in self.rows.drain(..) {
+            let _ = self.menu.remove(&row);
         }
+        let text = heading(displays);
+        self.header.set_text(text.clone());
+        self.heading_text = text;
+
+        // The trailing block is [separator, show, quit]; everything else goes
+        // above it, in insertion order.
+        let mut at = self.menu.items().len().saturating_sub(3);
+        for display in displays {
+            let head = MenuItem::with_id(
+                format!("{ID_DISPLAY_PREFIX}{}", display.index),
+                display.name.clone(),
+                false,
+                None,
+            );
+            if self.menu.insert(&head, at).is_ok() {
+                self.rows.push(head);
+                at += 1;
+            }
+            for (code, name) in &display.ports {
+                let row = MenuItem::with_id(
+                    format!("{ID_SWITCH_PREFIX}{}:{code}", display.index),
+                    name,
+                    true,
+                    None,
+                );
+                if self.menu.insert(&row, at).is_ok() {
+                    self.rows.push(row);
+                    at += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The disabled first row: what the menu is about, and how much of it.
+fn heading(displays: &[DisplayMenu]) -> String {
+    match displays {
+        [] => t!("no_monitor").to_string(),
+        [one] => one.name.clone(),
+        many => format!("displaymux · {} displays", many.len()),
     }
 }
 
@@ -275,8 +325,15 @@ fn forward_events(tx: Sender<TrayEvent>) {
     tray_icon::menu::MenuEvent::set_event_handler(Some(
         move |event: tray_icon::menu::MenuEvent| {
             let id = event.id.0.as_str();
-            let translated = if let Some(code) = id.strip_prefix(ID_SWITCH_PREFIX) {
-                Some(TrayEvent::Switch(code.to_string()))
+            // "input:<display index>:<code>" names a port on a specific display,
+            // so two displays sharing a code cannot be confused.
+            let translated = if let Some(rest) = id.strip_prefix(ID_SWITCH_PREFIX) {
+                rest.split_once(':').and_then(|(index, code)| {
+                    Some(TrayEvent::Switch {
+                        index: index.parse().ok()?,
+                        code: code.to_string(),
+                    })
+                })
             } else {
                 match id {
                     ID_REFRESH => Some(TrayEvent::Refresh),

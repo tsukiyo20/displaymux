@@ -45,9 +45,19 @@ ENVIRONMENT:
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    let p = format!("--{}=", name);
-    args.iter()
-        .find_map(|a| a.strip_prefix(&p).map(|s| s.to_string()))
+    let joined = format!("--{}=", name);
+    if let Some(value) = args
+        .iter()
+        .find_map(|a| a.strip_prefix(&joined).map(str::to_string))
+    {
+        return Some(value);
+    }
+    // Also accept the spaced form. Silently ignoring it turned `--index 1` into
+    // "display 0", which is a confusing way to read the wrong monitor.
+    let separate = format!("--{}", name);
+    args.windows(2)
+        .find(|pair| pair[0] == separate)
+        .map(|pair| pair[1].clone())
 }
 
 fn positional(args: &[String]) -> Vec<String> {

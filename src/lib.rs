@@ -25,6 +25,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 pub mod config;
 pub mod ddc;
 pub mod labels;
+pub mod layouts;
 pub mod settings;
 pub mod tray;
 pub mod update;

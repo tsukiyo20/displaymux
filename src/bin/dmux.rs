@@ -37,8 +37,18 @@ USAGE:
                                             you which input it is showing when
                                             the two machines differ in refresh
                                             rate.
+    dmux layouts                           list the layouts in the layout file
+    dmux layouts file                      print the layout file's path and contents
+    dmux layout <name> [--dry-run]         put every display in the layout where it asks,
+                                            e.g. `dmux layout work`
+    dmux layout-set <name> <display>=<code> ...
+                                            define or replace a layout. Quote display ids
+                                            that contain spaces:
+                                            dmux layout-set work "R32U81"=0x10 "MAG 274URFW"=0x0f
+    dmux layout-remove <name>              forget a layout
 
 ENVIRONMENT:
+    DMUX_LAYOUTS      path to the layout file
     DMUX_DDC_HELPER   path to dmux-ddc-helper
 "#
     );
@@ -464,6 +474,135 @@ fn cmd_update(args: &[String]) -> Result<(), DdcError> {
     }
 }
 
+/// List the layouts, or print the file itself.
+fn cmd_layouts(args: &[String]) -> Result<(), DdcError> {
+    let layouts = displaymux::layouts::Layouts::load();
+
+    if args.iter().any(|a| a == "file") {
+        let path = displaymux::config::dir()
+            .map(|d| d.join("layouts.json"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no configuration directory>".into());
+        println!("{path}");
+        return Ok(());
+    }
+
+    if layouts.is_empty() {
+        println!("no layouts defined");
+        println!();
+        println!(r#"  dmux layout-set work "R32U81"=0x10 "MAG 274URFW"=0x0f"#);
+        println!();
+        println!("  ...then  dmux layout work");
+        return Ok(());
+    }
+
+    for (name, targets) in layouts.entries() {
+        println!("{name}");
+        for (display, code) in targets {
+            println!("    {display:<16} {code}");
+        }
+    }
+    Ok(())
+}
+
+/// Put every display where a layout asks.
+fn cmd_layout_apply(args: &[String]) -> Result<(), DdcError> {
+    let Some(name) = positional(args).first().cloned() else {
+        eprintln!("error: which layout? `dmux layouts` lists them");
+        std::process::exit(2);
+    };
+    let layouts = displaymux::layouts::Layouts::load();
+    let Some(targets) = layouts.get(&name) else {
+        eprintln!("error: no layout named {name:?}");
+        std::process::exit(2);
+    };
+
+    let displays = ddc::list_displays(DEFAULT_TIMEOUT)?;
+    let (steps, missing) = displaymux::layouts::plan(targets, &displays);
+    for display in &missing {
+        eprintln!("skipped {display}: not connected");
+    }
+    if steps.is_empty() {
+        eprintln!("nothing to switch");
+        return Ok(());
+    }
+
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let mut failed = 0;
+    for step in &steps {
+        if dry_run {
+            println!(
+                "would switch {} [{}] to {}",
+                step.display, step.display_index, step.code
+            );
+            continue;
+        }
+        print!("switching {} to {} ... ", step.display, step.code);
+        match ddc::set_input(step.display_index, &step.code, DEFAULT_TIMEOUT) {
+            Ok(_) => println!("sent"),
+            Err(e) => {
+                // Keep going: one unreachable display should not leave the
+                // others where they were.
+                println!("failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    if failed > 0 {
+        return Err(DdcError::Protocol(format!("{failed} switch(es) failed")));
+    }
+    Ok(())
+}
+
+/// Define or replace a layout.
+fn cmd_layout_set(args: &[String]) -> Result<(), DdcError> {
+    let positional = positional(args);
+    let Some(name) = positional.first().cloned() else {
+        eprintln!("error: which name? e.g. `dmux layout-set work \"R32U81\"=0x10`");
+        std::process::exit(2);
+    };
+
+    let mut targets = std::collections::BTreeMap::new();
+    for spec in &positional[1..] {
+        // Split on the last '=' so a display id may itself contain one.
+        let Some((display, code)) = spec.rsplit_once('=') else {
+            eprintln!("error: {spec:?} is not <display>=<code>");
+            std::process::exit(2);
+        };
+        targets.insert(display.trim().to_string(), code.trim().to_string());
+    }
+    if targets.is_empty() {
+        eprintln!("error: a layout needs at least one <display>=<code>");
+        std::process::exit(2);
+    }
+
+    let mut layouts = displaymux::layouts::Layouts::load();
+    layouts.set(&name, targets);
+    layouts
+        .save()
+        .map_err(|e| DdcError::Protocol(e.to_string()))?;
+    println!("saved layout {name}");
+    Ok(())
+}
+
+fn cmd_layout_remove(args: &[String]) -> Result<(), DdcError> {
+    let Some(name) = positional(args).first().cloned() else {
+        eprintln!("error: which layout?");
+        std::process::exit(2);
+    };
+    let mut layouts = displaymux::layouts::Layouts::load();
+    if !layouts.remove(&name) {
+        eprintln!("error: no layout named {name:?}");
+        std::process::exit(2);
+    }
+    layouts
+        .save()
+        .map_err(|e| DdcError::Protocol(e.to_string()))?;
+    println!("removed layout {name}");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
@@ -482,6 +621,10 @@ fn main() {
         "vcp" => cmd_vcp(rest),
         "labels" => cmd_labels(rest),
         "label" => cmd_label(rest),
+        "layouts" => cmd_layouts(rest),
+        "layout" => cmd_layout_apply(rest),
+        "layout-set" => cmd_layout_set(rest),
+        "layout-remove" => cmd_layout_remove(rest),
         "update" => cmd_update(rest),
         "-h" | "--help" | "help" => {
             usage();

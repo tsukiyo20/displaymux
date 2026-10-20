@@ -34,12 +34,15 @@ pub enum TrayEvent {
     Show,
     /// Open the small window that checks for and installs a newer release.
     CheckUpdates,
+    /// Apply a named arrangement of several displays.
+    ApplyLayout(String),
     Quit,
 }
 
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_SWITCH_PREFIX: &str = "input:";
 const ID_DISPLAY_PREFIX: &str = "display:";
+const ID_LAYOUT_PREFIX: &str = "layout:";
 const ID_REFRESH: &str = "refresh";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
@@ -247,13 +250,20 @@ impl Tray {
     /// The block is rebuilt whenever the set of displays or ports changes, and
     /// only the labels are rewritten otherwise, so an open menu does not
     /// flicker.
-    pub fn update(&mut self, displays: &[DisplayMenu]) {
+    pub fn update(&mut self, displays: &[DisplayMenu], layouts: &[String]) {
         self.show.set_text(t!("tray_show"));
 
-        let same = self.rows.len() == displays.iter().map(|d| d.ports.len() + 1).sum::<usize>()
+        let layout_rows = if layouts.is_empty() {
+            0
+        } else {
+            layouts.len() + 1
+        };
+        let same = self.rows.len()
+            == displays.iter().map(|d| d.ports.len() + 1).sum::<usize>() + layout_rows
             && self.heading_text == heading(displays);
         if same {
-            // Same shape: only the labels can have moved.
+            // Same shape: only the labels can have moved, and layout names do
+            // not change while the menu is open.
             let mut rows = self.rows.iter();
             for display in displays {
                 if let Some(row) = rows.next() {
@@ -302,6 +312,33 @@ impl Tray {
                 }
             }
         }
+
+        // Layouts sit under the ports: they are the "do several things at once"
+        // version of what is above them.
+        if !layouts.is_empty() {
+            let head = MenuItem::with_id(
+                format!("{ID_LAYOUT_PREFIX}__heading"),
+                &*t!("layouts"),
+                false,
+                None,
+            );
+            if self.menu.insert(&head, at).is_ok() {
+                self.rows.push(head);
+                at += 1;
+            }
+            for name in layouts {
+                let row = MenuItem::with_id(
+                    format!("{ID_LAYOUT_PREFIX}{name}"),
+                    name.clone(),
+                    true,
+                    None,
+                );
+                if self.menu.insert(&row, at).is_ok() {
+                    self.rows.push(row);
+                    at += 1;
+                }
+            }
+        }
     }
 }
 
@@ -340,7 +377,10 @@ fn forward_events(tx: Sender<TrayEvent>) {
                     ID_CHECK_UPDATE => Some(TrayEvent::CheckUpdates),
                     ID_SHOW => Some(TrayEvent::Show),
                     ID_QUIT => Some(TrayEvent::Quit),
-                    _ => None,
+                    // "layout:<name>"
+                    _ => id
+                        .strip_prefix(ID_LAYOUT_PREFIX)
+                        .map(|name| TrayEvent::ApplyLayout(name.to_string())),
                 }
             };
             if let Some(ev) = translated {

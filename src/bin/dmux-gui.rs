@@ -247,6 +247,8 @@ mod gui {
         checking_update: bool,
         /// Whether this launch has already looked for a newer release.
         update_checked: bool,
+        /// The named arrangements in the layout file.
+        layouts: displaymux::layouts::Layouts,
         theme: ThemeChoice,
         /// The appearance actually in force, after resolving "system".
         dark: bool,
@@ -272,6 +274,7 @@ mod gui {
                 update_available: None,
                 checking_update: false,
                 update_checked: false,
+                layouts: displaymux::layouts::Layouts::load(),
                 theme: ThemeChoice::from_setting(settings_theme.as_deref()),
                 dark: true,
             };
@@ -343,7 +346,8 @@ mod gui {
                         .collect(),
                 })
                 .collect();
-            tray.update(&groups);
+            let layouts: Vec<String> = self.layouts.entries().map(|(n, _)| n.clone()).collect();
+            tray.update(&groups, &layouts);
         }
 
         /// Act on the tray clicks that need this view.
@@ -358,6 +362,7 @@ mod gui {
                 // command, so it gets the same confirmation rather than firing
                 // straight from a menu click.
                 TrayEvent::CheckUpdates => self.open_update(cx),
+                TrayEvent::ApplyLayout(name) => self.confirm_layout(name, cx),
                 TrayEvent::Switch { index, code } => {
                     let p = self.palette();
                     let target = SwitchTarget {
@@ -734,9 +739,34 @@ mod gui {
         name: String,
     }
 
+    impl SwitchTarget {
+        /// What the confirmation says above its buttons.
+        fn lines(&self) -> Vec<String> {
+            vec![
+                t!(
+                    "confirm_body",
+                    display = self.display.as_str(),
+                    name = self.name.as_str()
+                )
+                .to_string(),
+                t!("confirm_note").to_string(),
+            ]
+        }
+
+        fn switches(&self) -> Vec<(usize, String)> {
+            vec![(self.display_index, self.code.clone())]
+        }
+    }
+
     struct ConfirmView {
         p: Palette,
-        target: SwitchTarget,
+        /// Lines of text, the question first. A layout confirmation lists one
+        /// line per display beneath it.
+        lines: Vec<String>,
+        /// The switches this confirmation sends, in order.
+        switches: Vec<(usize, String)>,
+        /// Reported while the switches are in flight.
+        note: String,
         left: u8,
         /// `None` once the main window is closed: the menu bar can still switch,
         /// it just has nowhere to report to.
@@ -750,34 +780,40 @@ mod gui {
     /// time it is answered -- the main window may have closed in between. The
     /// update has to be *checked*, not assumed: swallowing its error is how the
     /// menu bar came to confirm a switch and then do nothing.
-    fn dispatch_switch(
+    fn dispatch_switches(
         app: Option<WeakEntity<SwitchApp>>,
-        index: usize,
-        code: String,
+        switches: Vec<(usize, String)>,
+        note: &str,
         cx: &mut App,
     ) {
         if let Some(app) = app {
+            let note = note.to_string();
+            let queued = switches.clone();
             if app
                 .update(cx, |app: &mut SwitchApp, cx| {
-                    app.fire_switch(index, code.clone(), cx)
+                    app.fire_switches(queued, note.clone(), cx)
                 })
                 .is_ok()
             {
                 return;
             }
         }
-        // Nothing to drive it, so ask the monitor directly -- one shot, like
-        // every other write.
-        cx.background_spawn(async move {
-            let _ = displaymux::ddc::set_input(index, &code, Duration::from_secs(12));
-        })
-        .detach();
+        // Nothing to drive it, so ask the monitor directly -- one shot each,
+        // like every other write.
+        for (index, code) in switches {
+            cx.background_spawn(async move {
+                let _ = displaymux::ddc::set_input(index, &code, Duration::from_secs(12));
+            })
+            .detach();
+        }
     }
 
     impl ConfirmView {
         fn new(
             p: Palette,
-            target: SwitchTarget,
+            lines: Vec<String>,
+            switches: Vec<(usize, String)>,
+            note: String,
             app: Option<WeakEntity<SwitchApp>>,
             window: Option<gpui_kit::AnyWindowHandle>,
             cx: &mut Context<Self>,
@@ -802,11 +838,11 @@ mod gui {
                     }
                 }
                 let _ = this.update(cx, |view, cx| {
-                    let code = view.target.code.clone();
-                    let index = view.target.display_index;
+                    let switches = view.switches.clone();
+                    let note = view.note.clone();
                     let app = view.app.clone();
                     let window = view.window;
-                    dispatch_switch(app, index, code, cx);
+                    dispatch_switches(app, switches, &note, cx);
                     if let Some(window) = window {
                         let _ = window.update(cx, |_, window, cx| ConfirmView::dismiss(window, cx));
                     }
@@ -816,7 +852,9 @@ mod gui {
 
             Self {
                 p,
-                target,
+                lines,
+                switches,
+                note,
                 left: CONFIRM_SECONDS,
                 app,
                 window,
@@ -836,7 +874,9 @@ mod gui {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let p = self.p;
             let left = self.left;
-            let target = self.target.clone();
+            let lines = self.lines.clone();
+            let switches = self.switches.clone();
+            let note = self.note.clone();
             let app = self.app.clone();
 
             div()
@@ -879,22 +919,23 @@ mod gui {
                         .flex_1()
                         .p(px(16.0))
                         .gap_2()
-                        .child(
-                            div().text_sm().child(
-                                t!(
-                                    "confirm_body",
-                                    display = target.display.as_str(),
-                                    name = target.name.as_str()
-                                )
-                                .to_string(),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(p.text_faint))
-                                .child(t!("confirm_note").to_string()),
-                        )
+                        .children(lines.iter().enumerate().map(|(i, line)| {
+                            // The question reads at body size; everything
+                            // under it is an explanation.
+                            if i == 0 {
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(p.text))
+                                    .child(line.clone())
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.text_faint))
+                                    .child(line.clone())
+                                    .into_any_element()
+                            }
+                        }))
                         .child(
                             div()
                                 .mt_auto()
@@ -942,12 +983,7 @@ mod gui {
                                 .child(t!("confirm_switch", count = left))
                                 .on_click(
                                     move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                        dispatch_switch(
-                                            app.clone(),
-                                            target.display_index,
-                                            target.code.clone(),
-                                            cx,
-                                        );
+                                        dispatch_switches(app.clone(), switches.clone(), &note, cx);
                                         ConfirmView::dismiss(window, cx);
                                     },
                                 )
@@ -1256,11 +1292,345 @@ mod gui {
         }
     }
 
+    /// A display as the editor needs it: index, name, and the ports to choose
+    /// between.
+    type EditorDisplay = (usize, String, Vec<(String, String)>);
+
+    /// One display in the layout editor: what it is called and what can be
+    /// chosen for it.
+    #[derive(Clone)]
+    struct EditorRow {
+        display_index: usize,
+        display: String,
+        ports: Vec<(String, String)>,
+        /// The code currently chosen, if any.
+        picked: Option<String>,
+    }
+
+    /// The layout editor: a name, and one row of port chips per display.
+    ///
+    /// A window of its own, like the confirmation, so the main window keeps
+    /// showing the displays you are arranging rather than becoming a form.
+    struct LayoutEditorView {
+        p: Palette,
+        name: Entity<InputState>,
+        rows: Vec<EditorRow>,
+        error: Option<String>,
+        app: Option<WeakEntity<SwitchApp>>,
+    }
+
+    impl LayoutEditorView {
+        fn new(
+            p: Palette,
+            name: Entity<InputState>,
+            rows: Vec<EditorRow>,
+            app: Option<WeakEntity<SwitchApp>>,
+            _cx: &mut Context<Self>,
+        ) -> Self {
+            Self {
+                p,
+                name,
+                rows,
+                error: None,
+                app,
+            }
+        }
+
+        /// Persist the layout, then close.
+        fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let name = self.name.read(cx).value().trim().to_string();
+            let mut targets = std::collections::BTreeMap::new();
+            for row in &self.rows {
+                if let Some(code) = &row.picked {
+                    targets.insert(row.display.clone(), code.clone());
+                }
+            }
+            // A nameless or empty layout would be a file entry that can never
+            // mean anything; saying so beats writing it and finding out later.
+            if name.is_empty() || targets.is_empty() {
+                self.error = Some(t!("layout_incomplete").to_string());
+                cx.notify();
+                return;
+            }
+
+            let Some(app) = self.app.clone() else {
+                window.remove_window();
+                return;
+            };
+            let saved = app.update(cx, |app: &mut SwitchApp, cx| {
+                app.layouts.set(&name, targets);
+                let result = app.layouts.save();
+                cx.notify();
+                result
+            });
+            match saved {
+                Ok(Ok(())) => {
+                    cx.global_mut::<Installed>().layout_window = None;
+                    window.remove_window();
+                }
+                Ok(Err(e)) => {
+                    self.error = Some(e.to_string());
+                    cx.notify();
+                }
+                Err(_) => window.remove_window(),
+            }
+        }
+    }
+
+    impl Render for LayoutEditorView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = self.p;
+            let weak = cx.entity().downgrade();
+            let error = self.error.clone();
+            let rows = self.rows.clone();
+
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .rounded_lg()
+                .bg(rgb(p.bg))
+                .text_color(rgb(p.text))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(38.0))
+                        .px(px(16.0))
+                        .border_b(px(1.0))
+                        .border_color(rgb(p.hairline))
+                        .child(
+                            Icon::default()
+                                .data(MARK_SVG)
+                                .text_color(rgb(p.accent))
+                                .with_size(Size::Size(px(13.0))),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(p.text_dim))
+                                .child(t!("layout_edit").to_string()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .p(px(16.0))
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(p.text_faint))
+                                        .child(t!("layout_name").to_string()),
+                                )
+                                .child(Input::new(&self.name)),
+                        )
+                        .children(rows.into_iter().map(|row| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(p.text_faint))
+                                        .child(row.display.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .children(row.ports.iter().map(|(code, port)| {
+                                            let code = code.clone();
+                                            let picked = row.picked.as_deref() == Some(&code);
+                                            let weak = weak.clone();
+                                            let display_index = row.display_index;
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "pick-{display_index}-{code}"
+                                                )))
+                                                .px_2()
+                                                .py(px(3.0))
+                                                .rounded_md()
+                                                .bg(if picked {
+                                                    rgb(p.accent)
+                                                } else {
+                                                    rgb(p.surface)
+                                                })
+                                                .text_color(if picked {
+                                                    rgb(p.on_accent)
+                                                } else {
+                                                    rgb(p.text_dim)
+                                                })
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .hover(|s| s.opacity(0.85))
+                                                .child(port.clone())
+                                                .on_click(
+                                                    move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                                        let _ = weak.update(
+                                                            cx,
+                                                            |view: &mut LayoutEditorView, cx| {
+                                                                if let Some(row) = view
+                                                                    .rows
+                                                                    .iter_mut()
+                                                                    .find(|r| r.display_index == display_index)
+                                                                {
+                                                                    row.picked = Some(code.clone());
+                                                                }
+                                                                view.error = None;
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    },
+                                                )
+                                                .into_any_element()
+                                        })),
+                                )
+                        }))
+                        .when_some(error, |d, error| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.accent))
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .mt_auto()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child({
+                                    div()
+                                        .id("layout-cancel")
+                                        .px_3()
+                                        .py(px(5.0))
+                                        .rounded_md()
+                                        .bg(rgb(p.surface_active))
+                                        .text_color(rgb(p.text_dim))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|s| s.opacity(0.85))
+                                        .child(t!("cancel").to_string())
+                                        .on_click(
+                                            move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                                cx.global_mut::<Installed>().layout_window = None;
+                                                window.remove_window();
+                                            },
+                                        )
+                                })
+                                .child({
+                                    let weak = weak.clone();
+                                    div()
+                                        .id("layout-save")
+                                        .px_3()
+                                        .py(px(5.0))
+                                        .rounded_md()
+                                        .bg(rgb(p.accent))
+                                        .text_color(rgb(p.on_accent))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|s| s.opacity(0.9))
+                                        .child(t!("layout_save").to_string())
+                                        .on_click(
+                                            move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                                let _ = weak.update(
+                                                    cx,
+                                                    |view: &mut LayoutEditorView, cx| {
+                                                        view.save(window, cx);
+                                                    },
+                                                );
+                                            },
+                                        )
+                                }),
+                        ),
+                )
+        }
+    }
+
+    /// Open the layout editor, seeded from `existing` when editing.
+    fn open_layout_editor(
+        cx: &mut App,
+        p: Palette,
+        displays: Vec<EditorDisplay>,
+        // The name field is created by the caller: it has to exist before the
+        // window opens, and it carries the name when editing.
+        name_field: Entity<InputState>,
+        seed_targets: std::collections::BTreeMap<String, String>,
+        app: Option<WeakEntity<SwitchApp>>,
+    ) {
+        if cx.global::<Installed>().layout_window.is_some() {
+            return;
+        }
+        let rows: Vec<EditorRow> = displays
+            .into_iter()
+            .map(|(index, display, ports)| {
+                let picked = seed_targets.get(&display).cloned();
+                EditorRow {
+                    display_index: index,
+                    display,
+                    ports,
+                    picked,
+                }
+            })
+            .collect();
+
+        let bounds = Bounds::centered(None, size(px(460.0), px(430.0)), cx);
+        let opened = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                titlebar: None,
+                is_resizable: false,
+                focus: true,
+                ..Default::default()
+            },
+            cx,
+            move |_window, cx| {
+                let rows = rows.clone();
+                let name_field = name_field.clone();
+                let app = app.clone();
+                cx.new(move |cx| LayoutEditorView::new(p, name_field, rows, app, cx))
+            },
+        );
+        if let Ok((handle, _)) = opened {
+            cx.global_mut::<Installed>().layout_window = Some(handle);
+        }
+    }
+
     /// Show the confirmation in its own small window, centred.
     ///
     /// Shared by both entrances -- the Switch button and the menu bar -- so
     /// there is one confirmation to learn rather than two.
     fn open_confirm(cx: &mut App, p: Palette, target: SwitchTarget) {
+        let note = t!("switching_to", code = target.code.as_str()).to_string();
+        open_confirm_for(cx, p, target.lines(), target.switches(), note);
+    }
+
+    /// Confirm an arbitrary set of switches. Used by a layout, which moves
+    /// several displays and has to say which.
+    fn open_confirm_for(
+        cx: &mut App,
+        p: Palette,
+        lines: Vec<String>,
+        switches: Vec<(usize, String)>,
+        note: String,
+    ) {
         // One at a time: a second tray click should not stack windows. The
         // handle is cleared by `ConfirmView::dismiss`, because a closed window's
         // handle does not reliably report itself as gone.
@@ -1283,11 +1653,13 @@ mod gui {
             },
             cx,
             move |_window, cx| {
-                let target = target.clone();
+                let lines = lines.clone();
+                let switches = switches.clone();
+                let note = note.clone();
                 let app = app.clone();
                 cx.new(move |cx| {
                     let window = cx.active_window();
-                    ConfirmView::new(p, target, app, window, cx)
+                    ConfirmView::new(p, lines, switches, note, app, window, cx)
                 })
             },
         );
@@ -1348,6 +1720,142 @@ mod gui {
             .detach();
         }
 
+        /// The layout names, plus the button that opens the editor.
+        fn layouts_row(&self, p: Palette, cx: &Context<Self>) -> gpui_kit::AnyElement {
+            let weak = cx.entity().downgrade();
+            let names: Vec<String> = self.layouts.entries().map(|(n, _)| n.clone()).collect();
+
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .px(px(14.0))
+                .pt(px(10.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.text_faint))
+                        .child(t!("layouts").to_string()),
+                )
+                .children(names.into_iter().map(|name| {
+                    let weak = weak.clone();
+                    div()
+                        .id(SharedString::from(format!("layout-{name}")))
+                        .px_2()
+                        .py(px(3.0))
+                        .rounded_md()
+                        .bg(rgb(p.surface))
+                        .text_color(rgb(p.text_dim))
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(p.surface_active)))
+                        .child(name.clone())
+                        .on_click(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                            let name = name.clone();
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.confirm_layout(name, cx);
+                            });
+                        })
+                        .into_any_element()
+                }))
+                .child({
+                    let weak = weak.clone();
+                    div()
+                        .id("layout-new")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(20.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(p.surface_active)))
+                        .child(
+                            Icon::new(IconName::Plus)
+                                .text_color(rgb(p.text_faint))
+                                .text_xs(),
+                        )
+                        .on_click(move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |app: &mut SwitchApp, cx| {
+                                app.open_editor(None, window, cx);
+                            });
+                        })
+                })
+                .into_any_element()
+        }
+
+        /// Open the editor, creating the name field first.
+        fn open_editor(
+            &mut self,
+            editing: Option<String>,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let seed = editing.clone().unwrap_or_default();
+            let name_field = cx.new(|cx| InputState::new(window, cx).default_value(seed));
+            let targets = editing
+                .as_ref()
+                .and_then(|name| self.layouts.get(name).cloned())
+                .unwrap_or_default();
+            let displays = self
+                .displays
+                .iter()
+                .map(|d| {
+                    let ports = d
+                        .inputs
+                        .iter()
+                        .map(|i| (i.code.clone(), i.name.clone()))
+                        .collect();
+                    (d.display_index, d.display_id.clone(), ports)
+                })
+                .collect();
+            let p = self.palette();
+            let app = cx.entity().downgrade();
+            open_layout_editor(cx, p, displays, name_field, targets, Some(app));
+        }
+
+        /// Turn a layout into a confirmation that lists every display it moves.
+        fn confirm_layout(&mut self, name: String, cx: &mut Context<Self>) {
+            let Some(targets) = self.layouts.get(&name).cloned() else {
+                return;
+            };
+            let displays: Vec<displaymux::ddc::DisplayRef> = self
+                .displays
+                .iter()
+                .map(|d| displaymux::ddc::DisplayRef {
+                    index: d.display_index,
+                    id: d.display_id.clone(),
+                })
+                .collect();
+            let (steps, missing) = displaymux::layouts::plan(&targets, &displays);
+            if steps.is_empty() {
+                self.message = t!("no_monitor").into();
+                cx.notify();
+                return;
+            }
+
+            let mut lines = vec![
+                t!("layout_apply", name = name.as_str()).to_string(),
+                t!("confirm_note").to_string(),
+            ];
+            for step in &steps {
+                let port = self.port_name(step.display_index, &step.code);
+                lines.push(format!("{} -> {}", step.display, port));
+            }
+            for display in &missing {
+                lines.push(t!("layout_skipped", display = display.as_str()).to_string());
+            }
+
+            let switches = steps
+                .into_iter()
+                .map(|step| (step.display_index, step.code))
+                .collect();
+            let note = t!("layout_applying", name = name.as_str()).to_string();
+            let p = self.palette();
+            open_confirm_for(cx, p, lines, switches, note);
+        }
+
         /// Open the update window seeded with whatever the check found.
         fn open_update(&mut self, cx: &mut Context<Self>) {
             let p = self.palette();
@@ -1365,15 +1873,21 @@ mod gui {
         }
 
         /// Send the switch the dialog was opened for.
-        fn fire_switch(&mut self, index: usize, code: String, cx: &mut Context<Self>) {
-            self.send(
-                Request::Switch {
-                    index,
-                    code: code.clone(),
-                },
-                t!("switching_to", code = code.as_str()),
-                cx,
-            );
+        fn fire_switches(
+            &mut self,
+            switches: Vec<(usize, String)>,
+            note: impl Into<SharedString>,
+            cx: &mut Context<Self>,
+        ) {
+            // Queued rather than sent: the worker applies them in order, and a
+            // layout has to move every display it names.
+            for (index, code) in switches {
+                let _ = self.worker.tx.send(Request::Switch { index, code });
+                self.pending += 1;
+            }
+            self.busy = true;
+            self.message = note.into();
+            cx.notify();
         }
 
         /// Edit one port's label in a dialog.
@@ -1923,6 +2437,7 @@ mod gui {
                         .pt(px(2.0))
                         .children(rows),
                 )
+                .child(self.layouts_row(p, cx))
                 .child(
                     div()
                         .mt_auto()
@@ -1980,6 +2495,8 @@ mod gui {
         confirm: Option<gpui_kit::AnyWindowHandle>,
         /// The open update window, if any.
         update_window: Option<gpui_kit::AnyWindowHandle>,
+        /// The open layout editor, if any.
+        layout_window: Option<gpui_kit::AnyWindowHandle>,
     }
 
     /// The languages this build ships.
@@ -2013,6 +2530,9 @@ mod gui {
                     }
                     TrayEvent::CheckUpdates => {
                         cx.update(|cx| forward_to_view(cx, TrayEvent::CheckUpdates))
+                    }
+                    TrayEvent::ApplyLayout(name) => {
+                        cx.update(|cx| forward_to_view(cx, TrayEvent::ApplyLayout(name)))
                     }
                 }
             }
@@ -2191,6 +2711,7 @@ mod gui {
                     window: None,
                     confirm: None,
                     update_window: None,
+                    layout_window: None,
                 });
                 match installed {
                     // Without a tray there is nothing to bring the window back, so

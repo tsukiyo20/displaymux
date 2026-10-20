@@ -22,6 +22,15 @@ save: 保存
 cancel: 取消
 
 display_unreachable: "这台显示器没有响应 DDC，很可能正在显示别的信号源。切换有时仍然有效；否则请在显示器上手动切回，或在那台电脑上运行 displaymux。"
+layouts: 布局
+layout_new: "新建布局"
+layout_skipped: "跳过 %{display}：未连接"
+layout_apply: "应用布局 %{name}？"
+layout_applying: "正在应用布局 %{name}…"
+layout_edit: "编辑布局"
+layout_name: "名称"
+layout_save: 保存
+layout_incomplete: "布局需要一个名称和至少一台显示器"
 update_title: 更新
 update_checking: "正在检查更新…"
 update_latest: 已是最新版本

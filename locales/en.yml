@@ -23,6 +23,15 @@ save: Save
 cancel: Cancel
 
 display_unreachable: "no DDC reply - this display is probably showing another source. Switching may still work; otherwise switch it on the monitor itself, or run displaymux on the other computer."
+layouts: Layouts
+layout_new: "New layout"
+layout_skipped: "skipped %{display}: not connected"
+layout_apply: "Apply layout %{name}?"
+layout_applying: "applying layout %{name}..."
+layout_edit: "Edit layout"
+layout_name: "Name"
+layout_save: Save
+layout_incomplete: "a layout needs a name and at least one display"
 update_title: Update
 update_checking: "checking for updates..."
 update_latest: "up to date"
